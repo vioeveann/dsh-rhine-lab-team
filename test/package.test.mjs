@@ -41,6 +41,7 @@ test('npm pack 实际内容不含 bots / HANDOFF', () => {
   const paths = new Set(pack.files.map((file) => file.path))
   assert.ok(paths.has('cordis.patch.yml'), 'bundle patch 要在包里')
   assert.ok(paths.has('LICENSE'), 'LICENSE 要在包里')
+  assert.ok(paths.has('docs/screenshots/overview.png'), 'README 展示图要在包里')
   assert.equal([...paths].some((path) => path === 'docs/HANDOFF.md'), false)
   assert.equal([...paths].some((path) => path.startsWith('bots/')), false)
   assert.equal([...paths].some((path) => path.startsWith('test/')), false)
