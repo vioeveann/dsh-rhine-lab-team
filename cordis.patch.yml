@@ -1,0 +1,12 @@
+# 团队插件：装上就启用，不用再去插件页勾一次。
+#
+# 同时插入头像插件 dsh-avatar-frame：子会话里显示对应 Bot 的头像与 ID 靠它读取
+# 本插件发布的 `dsh-team:identity/v1` 映射。它没有这条映射时行为与普通头像插件一致。
+#
+# 注意（写进 README 给用户看）：其它会接管聊天头像/ID 的插件与本插件同时启用会互相覆盖，
+# 用户装了同类插件时应在插件页关掉其中一个。
+- insert:
+    - id: dsh-rhine-lab-team
+      name: dsh-rhine-lab-team
+    - id: dsh-avatar-frame
+      name: dsh-avatar-frame

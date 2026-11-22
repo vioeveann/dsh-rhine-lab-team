@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax check
+        run: npm run check
+      - name: Unit and UI behaviour tests
+        run: npm test
+      - name: Package content check
+        run: npm pack --dry-run
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install browser test dependencies
+        working-directory: test/e2e
+        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Install Chromium
+        working-directory: test/e2e
+        run: npx playwright install --with-deps chromium
+      - name: Browser smoke test
+        working-directory: test/e2e
+        run: npx playwright test

@@ -1,0 +1,32 @@
+# 运行期产物：不进仓库
+.state/
+.debug/
+.team-work/
+deliverables/
+.tmp/
+tmp/
+tmp-usage/
+tmp-pack.json
+*.univer
+node_modules/
+test/e2e/node_modules/
+test/e2e/test-results/
+test/e2e/playwright-report/
+icon-preview.png
+
+# Bot 数据是每个用户的运行期数据，不进仓库（内置三个由 host/builtin-bots.js 种下）
+bots/
+
+# 手工备份（建仓后 git 就是备份，这些不再进 history）
+*.bak
+*.bak-*
+
+# 每个 Bot 的记忆目录自带 git（快照/回退功能用的），由插件单独管历史
+bots/*/memory/
+
+# 测试残留
+bots/tmp-*/
+
+# 系统垃圾
+.DS_Store
+Thumbs.db

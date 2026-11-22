@@ -1,0 +1,12 @@
+# 开发与运行期文件，不进包
+.state/
+.debug/
+.team-work/
+deliverables/
+tmp/
+test/
+bots/
+docs/HANDOFF.md
+docs/SCHEDULE.md
+docs/skin-aurora.md
+*.log
