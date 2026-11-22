@@ -67,6 +67,7 @@ test('quickstart dialog scrolls with the wheel', async ({ page }) => {
   const dialog = page.locator('[role="dialog"]')
   const pre = dialog.locator('pre')
   await expect(pre).toBeVisible()
+  await expect(pre).toContainText('第 120 行')
   const box = await pre.boundingBox()
   expect(box.height).toBeLessThan(700)
   const scrolled = await page.evaluate(() => {
