@@ -75,6 +75,12 @@ dsh plugin add https://github.com/vioeveann/dsh-rhine-lab-team
 - **子会话身份**：依赖 `dsh-avatar-frame`（声明为 `latest`，npm 上需 ≥ 0.15）时显示 Bot 自己的头像和 ID，点它进设置，语音关闭
 - **测试**：290 条（`npm test`）+ 1 条浏览器冒烟测试（`test/e2e`）
 
+## 反馈
+
+遇到 bug、觉得哪里不好用，欢迎开 Issue：<https://github.com/vioeveann/dsh-rhine-lab-team/issues>。也欢迎直接提意见，不用客气。
+
+英文版（README 与界面）在计划中。
+
 ## 目录
 
 ```
