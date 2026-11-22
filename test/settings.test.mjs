@@ -56,11 +56,12 @@ test('saving normalizes and round-trips', async () => {
 })
 
 test('the deliverable root prefers env, then settings, then the default', () => {
-  const root = 'C:/repo'
+  const root = join(tmpdir(), 'repo')
+  const absolute = process.platform === 'win32' ? 'D:/abs' : '/abs'
   assert.equal(resolveDeliverableRoot(root, { deliverableRoot: '' }, ''), DEFAULT_DELIVERABLE_DIR)
   assert.equal(resolveDeliverableRoot(root, { deliverableRoot: 'out' }, ''), join(root, 'out'))
-  assert.equal(resolveDeliverableRoot(root, { deliverableRoot: 'out' }, 'D:/deliver'), 'D:/deliver')
-  assert.equal(resolveDeliverableRoot(root, { deliverableRoot: 'D:/abs' }, ''), 'D:/abs')
+  assert.equal(resolveDeliverableRoot(root, { deliverableRoot: 'out' }, join(tmpdir(), 'deliver')), join(tmpdir(), 'deliver'))
+  assert.equal(resolveDeliverableRoot(root, { deliverableRoot: absolute }, ''), absolute)
 })
 
 test('称谓默认「你」，可以改成别的，空串回落', async () => {
