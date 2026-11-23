@@ -3884,7 +3884,8 @@ export function installChildDecoration(ctx, options) {
     // workspace-write 授权，否则 Bot 连自己的任务目录都写不进去。
     let writableRootRegistered = false
     try {
-      const sandboxPolicy = agent?.ctx?.sandboxPolicy ?? ctx?.sandboxPolicy ?? ctx?.get?.('sandboxPolicy')
+      const sandboxPolicy = (typeof agent?.ctx?.get === 'function' ? agent.ctx.get('sandboxPolicy') : undefined)
+        ?? (typeof ctx?.get === 'function' ? ctx.get('sandboxPolicy') : undefined)
       if (hit?.taskDir && typeof sandboxPolicy?.registerWritableRoot === 'function') {
         sandboxPolicy.registerWritableRoot(agent.session, hit.taskDir)
         writableRootRegistered = true
