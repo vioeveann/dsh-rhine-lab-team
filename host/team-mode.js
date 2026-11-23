@@ -384,6 +384,10 @@ export function installTeamMode(ctx, options) {
             model: entry.model ?? '',
             grade: entry.grade ?? '',
             continuesFrom: entry.continuesFrom ?? '',
+            dependsOn: Array.isArray(entry.dependsOn) ? entry.dependsOn : [],
+            dependsOnMode: entry.dependsOnMode ?? 'done',
+            chainId: entry.chainId ?? entry.taskId ?? '',
+            blockedBy: entry.blockedBy ?? '',
           }))
         json(res, 200, { tasks: rows })
       } catch (error) {
@@ -418,6 +422,10 @@ export function installTeamMode(ctx, options) {
             verdict: entry.verdict ?? '',
             model: entry.model ?? '',
             tokens: entry.tokens ?? null,
+            dependsOn: Array.isArray(entry.dependsOn) ? entry.dependsOn : [],
+            dependsOnMode: entry.dependsOnMode ?? 'done',
+            chainId: entry.chainId ?? entry.taskId ?? '',
+            blockedBy: entry.blockedBy ?? '',
             startedAt: entry.startedAt ?? null,
             doneAt: entry.doneAt ?? null,
           },
@@ -1195,7 +1203,10 @@ export function installTeamMode(ctx, options) {
       }
       try {
         const body = JSON.parse((await readBody(req)) || '{}')
-        const result = await api?.cancel?.(body.taskId)
+        const result =
+          body.chain === true
+            ? await api?.cancelChain?.(body.taskId)
+            : await api?.cancel?.(body.taskId)
         json(res, 200, result ?? { ok: false, error: '取消接口没接上' })
       } catch (error) {
         json(res, 400, { ok: false, error: String(error?.message ?? error) })

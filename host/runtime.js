@@ -154,7 +154,16 @@ async function loadTasks() {
       if (row.status === 'running' && !row.doneAt) {
         row.status = 'failed'
         row.doneAt = Date.now()
+        row.restartInterrupted = true
         row.note = row.note || '进程重启时中断'
+      }
+      // 排队等依赖的任务没起过子会话，重启后不可能自己再开：标受阻，让用户重派。
+      if (row.status === 'queued' && !row.doneAt) {
+        row.status = 'blocked'
+        row.doneAt = Date.now()
+        row.restartInterrupted = true
+        row.blockedBy = row.blockedBy || '进程重启时还在排队，没有开始'
+        row.note = row.note || row.blockedBy
       }
       tasks.set(row.taskId, row)
     }

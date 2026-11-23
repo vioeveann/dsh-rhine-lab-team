@@ -101,6 +101,12 @@ export function buildTaskRecord(entry, options = {}) {
   if (parent !== '') lines.push(`- 父会话：${parent}`)
   const session = String(entry?.sessionId ?? '').trim()
   if (session !== '') lines.push(`- 子会话：${session}`)
+  if (Array.isArray(entry?.dependsOn) && entry.dependsOn.length > 0) {
+    const mode = entry.dependsOnMode === 'accepted' ? '（验收后放行）' : ''
+    lines.push(`- 依赖${mode}：${entry.dependsOn.join('、')}`)
+  }
+  const blockedBy = String(entry?.blockedBy ?? '').trim()
+  if (blockedBy !== '') lines.push(`- 阻塞：${blockedBy}`)
 
   const brief = entry?.brief ?? {}
   const task = String(brief.task ?? '').trim()

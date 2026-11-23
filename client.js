@@ -4908,6 +4908,158 @@ function createMembersPanel(React, host) {
     )
   }
 
+  /**
+   * 任务依赖图：按 chainId 取一条链，按深度从左到右排；只读，不做拖拽。
+   * 画布是辅助视图，真正的调度仍在 host 的依赖队列里。
+   */
+  function TaskGraphDialog({ tasks, onClose, p }) {
+    const byChain = new Map()
+    for (const task of tasks ?? []) {
+      const chainId = String(task.chainId ?? task.taskId ?? '')
+      if (chainId === '') continue
+      if (!byChain.has(chainId)) byChain.set(chainId, [])
+      byChain.get(chainId).push(task)
+    }
+    const chains = [...byChain.values()]
+    const withEdges = chains.filter((list) => list.some((task) => (task.dependsOn ?? []).length > 0))
+    const picked = (withEdges.length > 0 ? withEdges : chains)
+      .sort((a, b) => Math.max(...b.map((t) => t.startedAt ?? 0)) - Math.max(...a.map((t) => t.startedAt ?? 0)))[0] ?? []
+    const ids = new Set(picked.map((task) => task.taskId))
+    const edges = []
+    for (const task of picked) {
+      for (const dep of task.dependsOn ?? []) {
+        if (ids.has(dep)) edges.push([dep, task.taskId])
+      }
+    }
+    const depth = new Map(picked.map((task) => [task.taskId, 0]))
+    for (let round = 0; round < picked.length; round += 1) {
+      let changed = false
+      for (const task of picked) {
+        for (const dep of task.dependsOn ?? []) {
+          if (!ids.has(dep)) continue
+          const next = (depth.get(dep) ?? 0) + 1
+          if (next > (depth.get(task.taskId) ?? 0)) {
+            depth.set(task.taskId, next)
+            changed = true
+          }
+        }
+      }
+      if (!changed) break
+    }
+    const cols = new Map()
+    for (const task of picked) {
+      const d = depth.get(task.taskId) ?? 0
+      if (!cols.has(d)) cols.set(d, [])
+      cols.get(d).push(task)
+    }
+    const maxDepth = Math.max(0, ...[...cols.keys()])
+    const maxRows = Math.max(1, ...[...cols.values()].map((list) => list.length))
+    const width = 80 + (maxDepth + 1) * 150
+    const height = 58 + maxRows * 54
+    const colorOf = (status) => {
+      if (status === 'accepted') return '#5C8A4A'
+      if (status === 'ready') return '#B07A2A'
+      if (status === 'blocked' || status === 'failed' || status === 'rejected') return '#A14032'
+      if (status === 'running') return '#2F6B6B'
+      return '#7A807A'
+    }
+    const pos = new Map()
+    for (const [d, list] of cols) {
+      list.forEach((task, row) => {
+        pos.set(task.taskId, { x: 18 + d * 150, y: 18 + row * 54 })
+      })
+    }
+    return h(
+      'div',
+      {
+        style: {
+          position: 'fixed',
+          inset: 0,
+          zIndex: 80,
+          background: 'rgba(28,30,28,0.42)',
+          display: 'grid',
+          placeItems: 'center',
+          padding: 18,
+        },
+        onClick: onClose,
+      },
+      h(
+        'div',
+        {
+          onClick: (event) => event.stopPropagation(),
+          style: {
+            width: 'min(92vw, 560px)',
+            maxHeight: '82vh',
+            overflow: 'auto',
+            background: '#F6F1E5',
+            border: '1px solid #E4DCC9',
+            borderRadius: 12,
+            padding: 14,
+            boxShadow: '0 18px 50px rgba(0,0,0,0.22)',
+          },
+        },
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },
+          h('strong', { style: { fontSize: 13, color: '#292923' } }, '任务依赖图'),
+          h('span', { style: { fontSize: 10, color: p.faint } }, picked.length ? `链 ${picked[0].chainId ?? picked[0].taskId} · ${picked.length} 件` : '还没有任务'),
+          h('button', {
+            type: 'button',
+            onClick: onClose,
+            style: { marginLeft: 'auto', border: 0, background: 'transparent', color: p.dim, cursor: 'pointer', fontSize: 14 },
+          }, '×'),
+        ),
+        picked.length === 0
+          ? h('div', { style: { padding: '24px 8px', fontSize: 11, color: p.faint } }, '还没有可画的任务。先派一件活。')
+          : h(
+              'svg',
+              { width: '100%', viewBox: `0 0 ${width} ${height}`, style: { display: 'block' } },
+              h(
+                'defs',
+                null,
+                h('marker', {
+                  id: 'dsh-team-arrow',
+                  markerWidth: 8,
+                  markerHeight: 8,
+                  refX: 7,
+                  refY: 4,
+                  orient: 'auto',
+                }, h('path', { d: 'M0 0 L8 4 L0 8 z', fill: 'rgba(41,41,35,0.35)' })),
+              ),
+              edges.map(([from, to]) => {
+                const a = pos.get(from)
+                const b = pos.get(to)
+                if (!a || !b) return null
+                return h('line', {
+                  key: `e-${from}-${to}`,
+                  x1: a.x + 122,
+                  y1: a.y + 18,
+                  x2: b.x - 2,
+                  y2: b.y + 18,
+                  stroke: 'rgba(41,41,35,0.28)',
+                  strokeWidth: 1.2,
+                  markerEnd: 'url(#dsh-team-arrow)',
+                })
+              }),
+              picked.map((task) => {
+                const at = pos.get(task.taskId) ?? { x: 18, y: 18 }
+                const label = String(task.bot ?? '').slice(0, 10)
+                const shortId = String(task.taskId ?? '').replace(/^t-/, '').slice(0, 8)
+                const status = String(task.status ?? '')
+                return h(
+                  'g',
+                  { key: task.taskId, transform: `translate(${at.x},${at.y})` },
+                  h('rect', { width: 122, height: 34, rx: 7, fill: '#FFFDF7', stroke: colorOf(status), strokeWidth: 1.2 }),
+                  h('text', { x: 8, y: 14, fontSize: 9, fill: '#292923', fontFamily: 'inherit' }, `${label} ${shortId}`),
+                  h('text', { x: 8, y: 26, fontSize: 8, fill: colorOf(status), fontFamily: 'inherit' }, status || 'queued'),
+                )
+              }),
+            ),
+        h('div', { style: { marginTop: 8, fontSize: 9.5, lineHeight: 1.5, color: p.faint } }, '箭头表示依赖：左边先跑，右边等它。验收门任务在上游通过后才放行。'),
+      ),
+    )
+  }
+
   function Panel(props) {
     const skin = useSkin()
     const p = palette()
@@ -4915,6 +5067,7 @@ function createMembersPanel(React, host) {
     // Live roster from the host; the demo list is only a first-paint fallback.
     const [revision, setRevision] = React.useState(0)
     const [boardOpen, setBoardOpen] = React.useState(false)
+    const [graphOpen, setGraphOpen] = React.useState(false)
     const [allTasks, setAllTasks] = React.useState([])
     const [boardFilter, setBoardFilter] = React.useState('all')
 
@@ -5749,6 +5902,8 @@ function createMembersPanel(React, host) {
             ),
           ),
           detail.brief?.task ? h('div', null, `任务单：${detail.brief.task}`) : null,
+          detail.dependsOn?.length ? h('div', null, `依赖${detail.dependsOnMode === 'accepted' ? '（验收后放行）' : ''}：${detail.dependsOn.join('、')}`) : null,
+          detail.blockedBy ? h('div', { style: { color: p.warn } }, `阻塞：${detail.blockedBy}`) : null,
           detail.brief?.accept ? h('div', null, `验收：${detail.brief.accept}`) : null,
           detail.brief?.redlines ? h('div', null, `红线：${detail.brief.redlines}`) : null,
           detail.cwd ? h('div', { style: { wordBreak: 'break-all' } }, `目录：${detail.cwd}`) : null,
@@ -5820,6 +5975,24 @@ function createMembersPanel(React, host) {
           },
         },
         boardOpen ? '只看最近' : '看全部',
+      ),
+      h(
+        'button',
+        {
+          type: 'button',
+          title: '查看任务依赖关系',
+          onClick: () => setGraphOpen(true),
+          style: {
+            padding: '1px 6px',
+            fontSize: 10,
+            color: p.dim,
+            background: 'transparent',
+            border: `1px solid ${p.line}`,
+            borderRadius: aurora ? 2 : 4,
+            cursor: 'pointer',
+          },
+        },
+        '依赖图',
       ),
       boardOpen
         ? h(
@@ -5947,6 +6120,12 @@ function createMembersPanel(React, host) {
                   h('span', { style: { color: p.dim } }, `@${task.bot}`),
                   botRole ? h('span', { style: { color: p.faint } }, botRole) : null,
                   task.continuesFrom ? h('span', { style: { color: p.accentSoft }, title: `原会话继续：${task.continuesFrom}` }, '续') : null,
+                  task.dependsOn?.length
+                    ? h('span', {
+                        style: { color: task.status === 'blocked' ? p.danger : p.faint },
+                        title: task.blockedBy || `依赖：${task.dependsOn.join('、')}`,
+                      }, task.status === 'blocked' ? '依赖未满足' : task.status === 'queued' ? `${task.dependsOnMode === 'accepted' ? '等验收' : '等'} ${task.dependsOn.join('、')}` : `依赖 ${task.dependsOn.join('、')}`)
+                    : null,
                   task.startedAt ? h('span', { style: { color: p.faint } }, formatDuration(durationSec)) : null,
                   task.tokens?.total ? h('span', { style: { color: p.faint } }, `${formatTokens(task.tokens.total)} tok`) : null,
                   h('span', { style: { color: p.faint, marginLeft: 'auto' } }, task.taskId),
@@ -6125,6 +6304,7 @@ function createMembersPanel(React, host) {
         : null,
       promoteDialog,
       growthDialog,
+      graphOpen ? h(TaskGraphDialog, { tasks: allTasks, onClose: () => setGraphOpen(false), p }) : null,
     )
   }
 

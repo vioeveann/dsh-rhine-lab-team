@@ -1099,10 +1099,70 @@ export function activeTaskCount(tasks, sessionId) {
   let count = 0
   for (const entry of tasks?.values?.() ?? []) {
     if (entry.doneAt) continue
+    // 排队等依赖的任务不占并发名额：它还没起子会话。
+    if (entry.status === 'queued') continue
     if (entry.parentSession !== sessionId) continue
     count += 1
   }
   return count
+}
+
+/**
+ * 任务依赖：接受数组、JSON 数组字符串，或逗号/空白分隔的字符串。
+ * 去重、去空，保持原顺序。
+ * @param raw - dependsOn 参数。
+ * @returns 任务号数组。
+ */
+export function normalizeDependsOn(raw) {
+  let list = []
+  if (Array.isArray(raw)) {
+    list = raw
+  } else {
+    const text = String(raw ?? '').trim()
+    if (text === '') return []
+    try {
+      const parsed = JSON.parse(text)
+      list = Array.isArray(parsed) ? parsed : [text]
+    } catch {
+      list = text.split(/[,\s]+/)
+    }
+  }
+  const seen = new Set()
+  const out = []
+  for (const value of list) {
+    const id = String(value ?? '').trim()
+    if (id === '' || seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  return out
+}
+
+/**
+ * 一个依赖任务当前算什么状态。
+ * ready 只是「跑完了、等验收」，下游可以先做；rejected/failed 等才算坏。
+ * @param entry - 依赖的账本行。
+ * @returns ok | bad | pending | missing。
+ */
+export function dependencyState(entry, mode = 'done') {
+  if (!entry) return 'missing'
+  const status = String(entry.status ?? '')
+  if (status === 'accepted') return 'ok'
+  // accepted 模式：跑完还不算数，必须验收通过；验收前下游不能动。
+  if (mode === 'accepted' && status === 'ready') return 'pending'
+  if (status === 'ready') return 'ok'
+  if (['rejected', 'failed', 'timeout', 'blocked', 'cancelled', 'needs-decision'].includes(status)) return 'bad'
+  // queued 只是在排队，还没有结论；和 running 一样先等。
+  return 'pending'
+}
+
+/**
+ * 依赖放行模式：done = 上游跑完就放行；accepted = 上游验收通过才放行。
+ * @param raw - 工具参数。
+ * @returns done | accepted。
+ */
+export function normalizeDependsOnMode(raw) {
+  return String(raw ?? '').trim().toLowerCase() === 'accepted' ? 'accepted' : 'done'
 }
 
 /**
@@ -1140,6 +1200,67 @@ export function registerTeamTools(ctx, options) {
   }
   /** 正在跑的任务 → 句柄，用来中止。 */
   const running = new Map()
+
+  /** 任务号：并行派活时同一毫秒可能起两件，随机尾必须带。 */
+  const newTaskId = () => `t-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+
+  /**
+   * 把一件活标成「受阻」：账本留痕，面板能看见为什么没跑。
+   * @param taskId - 任务号。
+   * @param botId - Bot id。
+   * @param parentSession - 父会话。
+   * @param brief - 任务单。
+   * @param dependsOn - 依赖任务号。
+   * @param reason - 阻塞原因。
+   */
+  function markBlocked(taskId, botId, parentSession, brief, dependsOn, reason, extra = {}) {
+    tasks?.set(taskId, {
+      taskId,
+      bot: botId,
+      parentSession,
+      startedAt: Date.now(),
+      doneAt: Date.now(),
+      status: 'blocked',
+      dependsOn,
+      dependsOnMode: extra.dependsOnMode ?? 'done',
+      chainId: extra.chainId ?? taskId,
+      blockedBy: reason,
+      note: reason,
+      brief,
+    })
+    void persistTasks?.()
+    options.api?.broadcast?.({ type: 'tasks' })
+    options.api?.broadcast?.({ type: 'task-done', taskId, bot: botId, status: 'blocked', text: reason.slice(0, 600) })
+  }
+
+  /**
+   * 等依赖都跑完。上游坏掉就立刻返回，不等满超时。
+   * @param ids - 依赖任务号。
+   * @param signal - 父会话信号。
+   * @returns `{ ok, reason? }`。
+   */
+  async function waitForDependencies(ids, signal, mode = 'done', timeoutMs = 1_800_000) {
+    const list = normalizeDependsOn(ids)
+    const deadline = Date.now() + Math.max(10_000, Number(timeoutMs) || 0)
+    while (list.length > 0) {
+      if (signal?.aborted) return { ok: false, reason: '等依赖时父会话被中止' }
+      if (Date.now() > deadline) return { ok: false, reason: '等依赖超时' }
+      let pending = false
+      for (const id of list) {
+        const entry = tasks?.get(id)
+        const state = dependencyState(entry, mode)
+        if (state === 'missing') return { ok: false, reason: `依赖任务不存在：${id}` }
+        if (state === 'bad') {
+          const status = String(entry?.status ?? '')
+          return { ok: false, reason: `上游 ${id} ${status === 'rejected' ? '被打回' : `状态是 ${status}`}` }
+        }
+        if (state === 'pending') pending = true
+      }
+      if (!pending) return { ok: true }
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+    return { ok: true }
+  }
 
   const getSettings = typeof options.getSettings === 'function' ? options.getSettings : () => ({})
   const maxConcurrent = () => Number(getSettings()?.maxConcurrent ?? 2)
@@ -1262,9 +1383,61 @@ export function registerTeamTools(ctx, options) {
         }
         // 接不上原会话（旧任务没存回复、会话没了）：退回新开会话，任务本身不丢。
       }
-      // 并行派活时同一毫秒可能起两件：任务号得自带随机尾，不能只靠时间戳。
-      const taskId = `t-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+      // 并行/带依赖的批量会预分配任务号，好在依赖里互相引用。
+      const suppliedTaskId = String(args?.__taskId ?? '').trim()
+      if (suppliedTaskId !== '' && tasks?.has(suppliedTaskId)) {
+        return JSON.stringify({ status: 'failed', error: `任务号已存在：${suppliedTaskId}` })
+      }
+      const taskId = suppliedTaskId || newTaskId()
       const parentSessionForLimit = exec?.agent?.session?.header?.id
+      const dependsOn = normalizeDependsOn(args?.dependsOn)
+      const dependsOnMode = normalizeDependsOnMode(args?.dependsOnMode)
+      // 一条链共用根任务号；下游继承上游的链，整链取消时一次收干净。
+      const chainId =
+        String(args?.chainId ?? '').trim() ||
+        (dependsOn.length > 0 ? String(tasks?.get(dependsOn[0])?.chainId ?? dependsOn[0]) : taskId)
+      if (dependsOn.length > 0) {
+        const queuedBrief = {
+          task,
+          goal: args?.goal,
+          deliverable: args?.deliverable,
+          accept: args?.accept,
+          redlines: args?.redlines,
+          materials: args?.materials,
+          retryNote,
+        }
+        tasks?.set(taskId, {
+          taskId,
+          bot: bot.id,
+          parentSession: parentSessionForLimit,
+          startedAt: Date.now(),
+          status: 'queued',
+          dependsOn,
+          dependsOnMode,
+          chainId,
+          model: typeof bot.model === 'string' ? bot.model : '',
+          brief: queuedBrief,
+        })
+        void persistTasks?.()
+        options.api?.broadcast?.({ type: 'tasks' })
+        const waitMs = Number(args?.dependsOnTimeoutSec ?? 1800) * 1000
+        const ready = await waitForDependencies(dependsOn, exec?.signal, dependsOnMode, waitMs)
+        if (!ready.ok) {
+          markBlocked(taskId, bot.id, parentSessionForLimit, queuedBrief, dependsOn, ready.reason, {
+            dependsOnMode,
+            chainId,
+          })
+          return JSON.stringify({
+            status: 'blocked',
+            bot: bot.id,
+            taskId,
+            dependsOn,
+            dependsOnMode,
+            chainId,
+            message: `依赖没满足：${ready.reason}`,
+          })
+        }
+      }
       const limit = maxConcurrent()
       const gate = canStartTask(tasks, parentSessionForLimit, limit)
       // 批量派活自己按并发上限分批，不再逐件过这个闸。
@@ -1272,6 +1445,7 @@ export function registerTeamTools(ctx, options) {
         return JSON.stringify({
           status: 'queued',
           bot: bot.id,
+          taskId,
           message: `这个会话还有 ${gate.active} 件在跑（上限 ${limit}），等一件回来再派。`,
         })
       }
@@ -1309,6 +1483,9 @@ export function registerTeamTools(ctx, options) {
         cwd: taskDir,
         startedAt: Date.now(),
         status: 'running',
+        dependsOn,
+        dependsOnMode,
+        chainId,
         // 面板要能看出这次实际用的是哪个模型（空 = 跟随默认）。
         model: typeof bot.model === 'string' ? bot.model : '',
         brief: {
@@ -1614,10 +1791,19 @@ export function registerTeamTools(ctx, options) {
             })
           }
         }
+        const failedEntry = tasks?.get(taskId)
+        if (failedEntry) {
+          failedEntry.status = 'failed'
+          failedEntry.doneAt = Date.now()
+          failedEntry.note = String(error?.message ?? error)
+        }
+        void persistTasks?.()
+        options.api?.broadcast?.({ type: 'tasks' })
         return JSON.stringify({
           status: 'failed',
           bot: bot.id,
           taskId,
+          dependsOn,
           sessionId: started.childId ?? childId,
           cwd: taskDir,
           error: String(error?.message ?? error),
@@ -2030,17 +2216,78 @@ export function registerTeamTools(ctx, options) {
   const cancelTools = tools.register(
     {
       name: 'team_cancel',
-      description: '中止一件正在跑的任务。它不会回结果，账本里记成「已取消」。',
+      description: '中止一件正在跑的任务。它不会回结果，账本里记成「已取消」。传 chain=true 会收掉同一条依赖链里所有没结束的任务。',
       parameters: {
         taskId: { type: 'string', required: true, description: '要中止的任务号' },
+        chain: { type: 'boolean', description: 'true = 整条依赖链一起中止。' },
       },
       output: {
         schema: { type: 'string' },
         render: (_args, value) => [{ type: 'text', text: String(value) }],
       },
       async execute(args) {
-        const result = await options.api?.cancel?.(args?.taskId)
+        const result =
+          args?.chain === true
+            ? await options.api?.cancelChain?.(args?.taskId)
+            : await options.api?.cancel?.(args?.taskId)
         return JSON.stringify(result ?? { ok: false, error: '取消接口没接上' })
+      },
+    },
+    {
+      when: ({ agent }) => {
+        const header = agent?.session?.header
+        if (!header || header.parentSession) return false
+        return isTeamSession ? isTeamSession(header.id) : false
+      },
+    },
+  )
+
+  const resumeTools = tools.register(
+    {
+      name: 'team_resume',
+      description: '重启后把因进程中断而卡住的任务按原任务单重新派一遍。只处理 restartInterrupted 的行；新任务号，旧行保留并标 supersededBy。',
+      parameters: {
+        taskId: { type: 'string', description: '只恢复这一件；不填则恢复全部可恢复的。' },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_args, value) => [{ type: 'text', text: String(value) }],
+      },
+      async execute(args, exec) {
+        const one = String(args?.taskId ?? '').trim()
+        const rows = [...(tasks?.values?.() ?? [])].filter((row) => {
+          if (one !== '' && row?.taskId !== one) return false
+          if (!row?.restartInterrupted) return false
+          return !row?.supersededBy
+        })
+        if (rows.length === 0) return JSON.stringify({ status: 'failed', error: '没有可恢复的任务' })
+        const results = []
+        for (const row of rows) {
+          const brief = row?.brief ?? {}
+          const raw = await dispatchTask(
+            {
+              ...brief,
+              bot: row.bot,
+              dependsOn: row.dependsOn,
+              dependsOnMode: row.dependsOnMode,
+              chainId: row.chainId,
+            },
+            exec,
+          )
+          let parsed = null
+          try {
+            parsed = JSON.parse(raw)
+          } catch {
+            parsed = { status: 'failed', output: String(raw) }
+          }
+          row.supersededBy = parsed?.taskId ?? ''
+          row.note = `重启后已重新派为 ${parsed?.taskId ?? '未知'}`
+          results.push({ from: row.taskId, to: parsed?.taskId, status: parsed?.status, message: parsed?.message })
+        }
+        void persistTasks?.()
+        options.api?.broadcast?.({ type: 'tasks' })
+        await debug?.({ event: 'resume-restart', count: results.length, results })
+        return JSON.stringify({ status: 'done', count: results.length, results })
       },
     },
     {
@@ -2099,6 +2346,9 @@ export function registerTeamTools(ctx, options) {
       materials: { type: 'string', description: '材料：它能读哪些文件或目录' },
       fromTask: { type: 'string', description: '交接：上一件任务号，把它的产物复制到新任务目录再开干' },
       continueFrom: { type: 'string', description: '同一件成果的后续改动（改 / 补 / 优化）：填上一件任务号，回原会话继续，不新开。和上一件无关的新活不要填。' },
+      dependsOn: { type: 'string', description: '依赖：JSON 数组或逗号分隔的任务号。上游默认跑完（ready）就放行；写 dependsOnMode=accepted 则必须验收通过。上游失败/打回就直接判 blocked，不 spawn。' },
+      dependsOnMode: { type: 'string', description: 'done（默认，上游跑完就放行）或 accepted（上游验收通过才放行）。' },
+      dependsOnTimeoutSec: { type: 'number', description: '等依赖的最长秒数，默认 1800；超时则 blocked。' },
     },
     output: {
       schema: { type: 'string' },
@@ -2122,13 +2372,15 @@ export function registerTeamTools(ctx, options) {
     {
       name: 'team_dispatch_many',
       description:
-        '一次派多件互不依赖的活（并行）。内部按并发上限分批跑，全部结束后一起返回；某件失败不影响其它件。适合多来源采集、多个独立审计这类可以同时干的活；有先后依赖的活别用这个，逐件派。',
+        '一次派多件活，可声明依赖。带 dependsOn 的项等上游跑完再开；同一批里可以用 key 给任务起别名，dependsOn 直接写 key。互不依赖的项并行，最多按并发上限；某件失败/打回，它下游会标 blocked，不会 spawn。',
       parameters: {
         tasks: {
           type: 'string',
           required: true,
-          description: 'JSON 数组，每项字段同 team_dispatch：{bot, task, goal?, deliverable?, accept?, redlines?, materials?, fromTask?, continueFrom?}',
+          description: 'JSON 数组，每项字段同 team_dispatch，可另加 key（批内别名）、dependsOn（任务号或批内 key 数组）、dependsOnMode（done/accepted）。',
         },
+        chainTimeoutSec: { type: 'number', description: '整条依赖链的最长秒数；超时后还没开始的任务标 blocked。默认不设。' },
+        dependsOnMode: { type: 'string', description: '整批默认的依赖放行模式：done（跑完就放行）或 accepted（验收通过才放行）。每项可单独覆盖。' },
       },
       output: {
         schema: { type: 'string' },
@@ -2160,24 +2412,218 @@ export function registerTeamTools(ctx, options) {
         }
         const limit = Math.max(1, Math.min(8, maxConcurrent()))
         const startedAt = Date.now()
-        const results = []
-        // 按并发上限分波：一波全部回来再开下一波。
-        for (let start = 0; start < items.length; start += limit) {
-          const wave = items.slice(start, start + limit)
-          const settled = await Promise.all(wave.map(async (item) => {
-            try {
-              const raw = await dispatchTask({ ...item, __batch: true }, exec)
-              try {
-                return JSON.parse(raw)
-              } catch {
-                return { status: 'failed', bot: item.bot, output: String(raw) }
-              }
-            } catch (error) {
-              return { status: 'failed', bot: item.bot, error: String(error?.message ?? error) }
-            }
-          }))
-          results.push(...settled)
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+        const usedIds = new Set(tasks?.keys?.() ?? [])
+        const freshId = () => {
+          let id = newTaskId()
+          while (usedIds.has(id)) id = newTaskId()
+          usedIds.add(id)
+          return id
         }
+        const prepared = items.map((item, index) => ({
+          item,
+          index,
+          taskId: freshId(),
+          key: String(item?.key ?? '').trim(),
+          mode: normalizeDependsOnMode(item?.dependsOnMode ?? args?.dependsOnMode),
+        }))
+        const aliases = new Map()
+        for (const row of prepared) {
+          if (row.key !== '') {
+            if (aliases.has(row.key)) {
+              return JSON.stringify({ status: 'failed', error: `批量里 key 重复：${row.key}` })
+            }
+            aliases.set(row.key, row.taskId)
+          }
+          aliases.set(row.taskId, row.taskId)
+        }
+        const resolved = new Map()
+        for (const row of prepared) {
+          const ids = []
+          for (const dep of normalizeDependsOn(row.item?.dependsOn)) {
+            const hit = aliases.get(dep)
+            if (hit) {
+              ids.push(hit)
+            } else if (tasks?.has(dep)) {
+              ids.push(dep)
+            } else {
+              return JSON.stringify({ status: 'failed', error: `第 ${row.index + 1} 项的依赖找不到：${dep}` })
+            }
+          }
+          if (ids.includes(row.taskId)) {
+            return JSON.stringify({ status: 'failed', error: `第 ${row.index + 1} 项不能依赖自己` })
+          }
+          resolved.set(row.taskId, ids)
+        }
+        const internal = new Set(prepared.map((row) => row.taskId))
+        const chainIds = new Map()
+        const chainIdOf = (id, seen = new Set()) => {
+          if (seen.has(id)) return id
+          seen.add(id)
+          const row = prepared.find((item) => item.taskId === id)
+          const own = String(row?.item?.chainId ?? '').trim()
+          if (own !== '') return own
+          const deps = resolved.get(id) ?? []
+          for (const dep of deps) {
+            if (internal.has(dep)) {
+              const inherited = chainIdOf(dep, seen)
+              if (inherited) return inherited
+            } else {
+              const inherited = tasks?.get(dep)?.chainId
+              if (inherited) return String(inherited)
+            }
+          }
+          return deps[0] || id
+        }
+        for (const row of prepared) {
+          chainIds.set(row.taskId, chainIdOf(row.taskId))
+        }
+        // 成环检查：只算同一批内部的边；外部任务号不参与拓扑。
+        const indegree = new Map(prepared.map((row) => [row.taskId, 0]))
+        const outgoing = new Map(prepared.map((row) => [row.taskId, []]))
+        for (const row of prepared) {
+          for (const dep of resolved.get(row.taskId)) {
+            if (!internal.has(dep)) continue
+            indegree.set(row.taskId, indegree.get(row.taskId) + 1)
+            outgoing.get(dep).push(row.taskId)
+          }
+        }
+        const queue = [...indegree.entries()].filter(([, count]) => count === 0).map(([id]) => id)
+        let seen = 0
+        while (queue.length > 0) {
+          const id = queue.shift()
+          seen += 1
+          for (const next of outgoing.get(id)) {
+            indegree.set(next, indegree.get(next) - 1)
+            if (indegree.get(next) === 0) queue.push(next)
+          }
+        }
+        if (seen !== internal.size) {
+          return JSON.stringify({ status: 'failed', error: '这批任务的 dependsOn 成环了，先理清先后顺序。' })
+        }
+        const results = new Array(items.length)
+        const pending = new Map(prepared.map((row) => [row.taskId, row]))
+        const active = new Map()
+        let externalDeadline = 0
+        const chainTimeoutSec = Number(args?.chainTimeoutSec ?? 0)
+        const chainDeadline = chainTimeoutSec > 0 ? startedAt + chainTimeoutSec * 1000 : 0
+        const block = (row, reason) => {
+          const deps = resolved.get(row.taskId)
+          tasks?.set(row.taskId, {
+            taskId: row.taskId,
+            bot: row.item.bot,
+            parentSession: exec?.agent?.session?.header?.id,
+            startedAt: Date.now(),
+            doneAt: Date.now(),
+            status: 'blocked',
+            dependsOn: deps,
+            dependsOnMode: row.mode,
+            chainId: chainIds.get(row.taskId),
+            blockedBy: reason,
+            note: reason,
+            brief: { task: String(row.item?.task ?? '') },
+          })
+          results[row.index] = {
+            status: 'blocked',
+            bot: row.item.bot,
+            taskId: row.taskId,
+            dependsOn: deps,
+            dependsOnMode: row.mode,
+            chainId: chainIds.get(row.taskId),
+            message: `依赖没满足：${reason}`,
+          }
+        }
+        while (pending.size > 0 || active.size > 0) {
+          if (chainDeadline > 0 && Date.now() > chainDeadline && pending.size > 0) {
+            for (const row of [...pending.values()]) {
+              block(row, `整链超过 ${chainTimeoutSec} 秒，剩下的任务没有开始`)
+            }
+            pending.clear()
+          }
+          for (const row of [...pending.values()]) {
+            if (active.size >= limit) break
+            const states = resolved.get(row.taskId).map((dep) => {
+              const entry = tasks?.get(dep)
+              // 同一批里还没轮到的任务：账本里暂时没有行，不能算「找不到」。
+              if (internal.has(dep) && (!entry || entry.status === 'queued')) {
+                return { dep, state: 'pending' }
+              }
+              return { dep, state: dependencyState(entry, row.mode) }
+            })
+            const bad = states.find((item) => item.state === 'bad' || item.state === 'missing')
+            if (bad) {
+              block(row, bad.state === 'missing' ? `找不到 ${bad.dep}` : `上游 ${bad.dep} 状态是 ${tasks?.get(bad.dep)?.status ?? '失败'}`)
+              pending.delete(row.taskId)
+              continue
+            }
+            // 验收门：上游跑完但还没验收，继续等；这不是失败，不要阻塞。
+            if (states.some((item) => item.state === 'pending')) continue
+            pending.delete(row.taskId)
+            const promise = (async () => {
+              try {
+                const raw = await dispatchTask({
+                  ...row.item,
+                  __taskId: row.taskId,
+                  __batch: true,
+                  dependsOn: resolved.get(row.taskId),
+                  dependsOnMode: row.mode,
+                  chainId: chainIds.get(row.taskId),
+                }, exec)
+                try {
+                  const parsed = JSON.parse(raw)
+                  return {
+                    ...parsed,
+                    dependsOn: resolved.get(row.taskId),
+                    dependsOnMode: row.mode,
+                    chainId: chainIds.get(row.taskId),
+                  }
+                } catch {
+                  return {
+                    status: 'failed',
+                    bot: row.item.bot,
+                    taskId: row.taskId,
+                    dependsOn: resolved.get(row.taskId),
+                    dependsOnMode: row.mode,
+                    chainId: chainIds.get(row.taskId),
+                    output: String(raw),
+                  }
+                }
+              } catch (error) {
+                return {
+                  status: 'failed',
+                  bot: row.item.bot,
+                  taskId: row.taskId,
+                  dependsOn: resolved.get(row.taskId),
+                  dependsOnMode: row.mode,
+                  chainId: chainIds.get(row.taskId),
+                  error: String(error?.message ?? error),
+                }
+              }
+            })()
+            active.set(row.taskId, { row, promise })
+          }
+          if (active.size === 0) {
+            if (pending.size === 0) break
+            // 只剩外部依赖还在跑：等一会儿；超时就整批标受阻，不无限挂住。
+            if (externalDeadline === 0) externalDeadline = Date.now() + Math.max(60_000, taskTimeoutMs() * 2)
+            if (Date.now() > externalDeadline) {
+              for (const row of pending.values()) block(row, '等外部依赖超时')
+              pending.clear()
+              break
+            }
+            await sleep(500)
+            continue
+          }
+          const settled = await Promise.race(
+            [...active.entries()].map(([id, item]) => item.promise.then((result) => ({ id, result }))),
+          )
+          active.delete(settled.id)
+          const row = prepared.find((item) => item.taskId === settled.id)
+          results[row.index] = settled.result
+          pending.delete(settled.id)
+        }
+        void persistTasks?.()
+        options.api?.broadcast?.({ type: 'tasks' })
         return JSON.stringify({
           status: 'done',
           count: results.length,
@@ -2200,12 +2646,12 @@ export function registerTeamTools(ctx, options) {
     {
       name: 'team_plan',
       description:
-        '不派活，只出计划：把要交给哪些 Bot、任务单、预计耗时与 token 摆出来，方便先给用户过目。确认后再用 team_dispatch 或 team_dispatch_many。',
+        '不派活，只出计划：把要交给哪些 Bot、任务单、预计耗时与 token 摆出来，方便先给用户过目。确认后再用 team_dispatch 或 team_dispatch_many。可带 dependsOn，计划里会标出等待关系。',
       parameters: {
         tasks: {
           type: 'string',
           required: true,
-          description: 'JSON 数组，字段同 team_dispatch，可加 size（quick / normal / complex）用来估时',
+          description: 'JSON 数组，字段同 team_dispatch，可加 size（quick / normal / complex）与 dependsOn 用来估时',
         },
       },
       output: {
@@ -2232,6 +2678,8 @@ export function registerTeamTools(ctx, options) {
             bot: id,
             name: bot?.name ?? id,
             role: bot?.role ?? '',
+            key: String(item?.key ?? ''),
+            dependsOn: normalizeDependsOn(item?.dependsOn),
             model: typeof bot?.model === 'string' && bot.model !== '' ? bot.model : '默认',
             available: bot ? bot.status !== 'disabled' : false,
             task: String(item?.task ?? ''),
@@ -2588,6 +3036,37 @@ export function registerTeamTools(ctx, options) {
       options.api?.broadcast?.({ type: 'tasks' })
       await debug?.({ event: 'cancel', taskId: id, bot: entry.bot, hadHandle: handle !== undefined })
       return { ok: true, taskId: id, status: 'cancelled' }
+    }
+    // 整链中止：同 chainId 里还没结束的任务一起收掉；正在跑的子会话尽力停。
+    options.api.cancelChain = async (taskId) => {
+      const id = String(taskId ?? '').trim()
+      const entry = tasks?.get(id)
+      if (!entry) return { ok: false, error: '没有这个任务' }
+      const chainId = String(entry.chainId ?? entry.taskId)
+      const rows = [...(tasks?.values?.() ?? [])].filter((row) => {
+        if (String(row?.chainId ?? row?.taskId) !== chainId) return false
+        if (row?.doneAt) return false
+        return ['queued', 'running', 'ready'].includes(String(row?.status ?? ''))
+      })
+      if (rows.length === 0) return { ok: false, error: '这条链没有在跑的任务' }
+      const cancelled = []
+      for (const row of rows) {
+        row.status = 'cancelled'
+        row.doneAt = Date.now()
+        row.note = row.note || '整链中止'
+        const handle = running.get(row.taskId)
+        running.delete(row.taskId)
+        cancelled.push(row.taskId)
+        try {
+          await handle?.dispose?.()
+        } catch {
+          // 忽略已结束的句柄
+        }
+      }
+      void persistTasks?.()
+      options.api?.broadcast?.({ type: 'tasks' })
+      await debug?.({ event: 'cancel-chain', taskId: id, chainId, cancelled })
+      return { ok: true, taskId: id, chainId, cancelled }
     }
     // 面板上的「晋升」：条件由 growth 判定，够格就升一阶、经验清零；
     // 升完让它在秘书会话下写一段感言，面板弹卡片。

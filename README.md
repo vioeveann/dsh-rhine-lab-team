@@ -49,7 +49,8 @@ dsh plugin add https://github.com/vioeveann/dsh-rhine-lab-team
 - **任务单**：结构化字段（目标 / 交付物 / 验收标准 / 红线 / 材料 / 交接来源）
 - **派活** `team_dispatch`：拉起任务会话，人设 + 团队记忆 + soul + 底座规则注入，沙箱 `workspace-write`
 - **续做** `continueFrom`：同一件成果的改 / 补 / 优化接回原会话，不新开；和上一件无关的新活照常新开
-- **批量派活** `team_dispatch_many`：一次交多件互不依赖的活，按并发上限分波并行，全部回来再汇总
+- **批量派活** `team_dispatch_many`：一次交多件活，可声明依赖；互不依赖的按并发上限并行，全部回来再汇总
+- **任务依赖**：`dependsOn` 让一件活等上游跑完再开；上游失败/打回，下游直接记 `blocked`，不会 spawn
 - **计划预览** `team_plan`：只出成员、任务单和预估耗时/token，不 spawn、不花 token，确认后再派
 - **交接**：`fromTask` 把上一件的产物复制到新任务目录，一个 Bot 的活直接交给下一个
 - **验收** `team_review`：通过 / 打回（打回必须写理由），可附核对依据 `evidence`；普通交付不强制审计，只有评 excellent 才必须有审计记录；一件活只验收一次，改判走 `team_user_feedback`
@@ -73,7 +74,19 @@ dsh plugin add https://github.com/vioeveann/dsh-rhine-lab-team
 - **成员组**：橙色锤子建组；每个组卡片最右边的锤子在组下面展开团队设置（同一个编辑器），顶部多一行「这个组」可以改名或删掉它
 - **界面**：成员面板（分组折叠、卡片扳手改成员、组内招募、头像裁剪、点卡片开子会话、任务详情、成长与晋升、橙色锤子进团队设置）、皮肤 classic / aurora
 - **子会话身份**：依赖 `dsh-avatar-frame`（声明为 `latest`，npm 上需 ≥ 0.15）时显示 Bot 自己的头像和 ID，点它进设置，语音关闭
-- **测试**：290 条（`npm test`）+ 1 条浏览器冒烟测试（`test/e2e`）
+- **测试**：302 条（`npm test`）+ 2 条浏览器冒烟测试（`test/e2e`）
+
+## 任务依赖
+
+有先后关系的活，用 `dependsOn` 串起来：
+
+- 单件：`team_dispatch` 加 `dependsOn: ["t-abc"]`（JSON 数组或逗号分隔的任务号）。
+- 批量：`team_dispatch_many` 里每项可加 `key` 当批内别名，另一些项用 `dependsOn: ["collect"]` 等 key 引用，不必先知道任务号。
+- 上游默认 `ready` 就放行；加 `dependsOnMode: "accepted"` 后，必须验收通过才放行。
+- 上游 `failed` / `rejected` / `timeout` / `blocked`，下游记 `blocked`，原因写进账本和任务详情，不会拉起子会话。
+- 批量可加 `chainTimeoutSec`，整条链超时后没开始的任务直接 `blocked`；`team_cancel` 传 `chain: true` 可整链中止。
+- 排队等依赖的任务不占并发名额；DSH 重启时还没开始的 `queued` / `running` 会标 `blocked` / `failed`，并保留任务单，可用 `team_resume` 按原单重派。
+- 面板「最近任务」右侧有「依赖图」，按链画出节点和箭头，只读。
 
 ## 反馈
 
