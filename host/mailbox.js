@@ -135,6 +135,17 @@ export function createMailbox({ root }) {
     })
   }
 
+  /** Unread messages for a bot, WITHOUT marking them read. */
+  function peekForPrompt(botId, limit = 5) {
+    return locked(async () => {
+      const id = text(botId)
+      return (await readAll())
+        .filter((row) => row.to === id && !row.readAt)
+        .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
+        .slice(0, Math.max(1, Math.min(20, Number(limit) || 5)))
+    })
+  }
+
   /** Unread messages for a bot, marked read when handed to it. */
   function takeForPrompt(botId, limit = 5) {
     return locked(async () => {
@@ -167,7 +178,7 @@ export function createMailbox({ root }) {
     return counts
   }
 
-  return { file, send, inbox, thread, markRead, takeForPrompt, unreadCounts }
+  return { file, send, inbox, thread, markRead, peekForPrompt, takeForPrompt, unreadCounts }
 }
 
 /** Format unread messages for injection into a task prompt. */

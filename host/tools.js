@@ -1481,10 +1481,21 @@ export function registerTeamTools(ctx, options) {
       const retryBlock = retryNote === '' ? '' : `\n\n上一轮打回原因（必须逐条处理）：\n${retryNote}`
       const auditBlock = bot.id === AUDITOR_ID ? AUDIT_BRIEF : ''
       let mailBlock = ''
+      let mailMessages = []
       try {
-        mailBlock = formatMailPrompt(await mailbox?.takeForPrompt?.(bot.id, 5))
+        mailMessages = await mailbox?.peekForPrompt?.(bot.id, 5) ?? []
+        mailBlock = formatMailPrompt(mailMessages)
       } catch (error) {
         await debug?.({ event: 'mailbox-prompt', ok: false, bot: bot.id, error: String(error?.message ?? error) })
+      }
+      // 只有任务真正启动后才标已读；拼任务单时只观察。
+      const markPromptMailRead = async () => {
+        if (mailMessages.length === 0) return
+        try {
+          await mailbox?.markRead?.(bot.id, mailMessages.map((message) => message.id))
+        } catch (error) {
+          await debug?.({ event: 'mailbox-mark-read', ok: false, bot: bot.id, error: String(error?.message ?? error) })
+        }
       }
       const brief = buildTaskPrompt({ ...args, task }) + handoffNote + retryBlock + auditBlock + mailBlock
       if (!brief) {
@@ -1522,7 +1533,10 @@ export function registerTeamTools(ctx, options) {
             materials: args?.materials,
           },
         }, exec)
-        if (continued && continued.status !== 'failed') return JSON.stringify(continued)
+        if (continued && continued.status !== 'failed') {
+          await markPromptMailRead()
+          return JSON.stringify(continued)
+        }
         if (continued) {
           await debug?.({ event: 'continue-fallback', from: continueFrom, error: continued.error })
         }
@@ -1702,6 +1716,7 @@ export function registerTeamTools(ctx, options) {
           return subagents.startActivation({ ...activation, name })
         }
         started = await startChild()
+        await markPromptMailRead()
       } catch (error) {
         pending.delete(childId)
         running.delete(taskId)

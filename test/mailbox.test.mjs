@@ -63,6 +63,23 @@ test('mailbox：每小时限额 20 条', async () => {
   }
 })
 
+test('mailbox：peekForPrompt 不标读，markRead 才清未读', async () => {
+  const { root, box } = await fixture()
+  try {
+    await box.send({ from: 'auditor', to: 'writer', subject: '待核', body: '先别标读。' })
+    const first = await box.peekForPrompt('writer')
+    const second = await box.peekForPrompt('writer')
+    assert.equal(first.length, 1)
+    assert.equal(second.length, 1)
+    assert.equal((await box.unreadCounts()).writer, 1)
+    assert.equal(await box.markRead('writer', first.map((row) => row.id)), 1)
+    assert.equal((await box.unreadCounts()).writer, undefined)
+    assert.deepEqual(await box.peekForPrompt('writer'), [])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('mailbox：takeForPrompt 取出未读并标读，formatMailPrompt 带线程提示', async () => {
   const { root, box } = await fixture()
   try {
