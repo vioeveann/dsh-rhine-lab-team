@@ -1399,8 +1399,9 @@ function createMembersPanel(React, host) {
         onMouseEnter: shake,
         style: {
           flex: '0 0 auto',
-          width: 20,
-          height: 20,
+          width: 16,
+          height: 18,
+          margin: '0 -2px',
           padding: 0,
           border: 0,
           background: 'transparent',
@@ -1415,7 +1416,7 @@ function createMembersPanel(React, host) {
       },
       h(
         'svg',
-        { width: 14, height: 11, viewBox: '0 0 14 11', 'aria-hidden': true, style: { display: 'block' } },
+        { width: 12, height: 9.5, viewBox: '0 0 14 11', 'aria-hidden': true, style: { display: 'block' } },
         h('rect', {
           x: 0.7,
           y: 0.7,
@@ -1481,7 +1482,7 @@ function createMembersPanel(React, host) {
         .then((response) => response.json())
         .then((payload) => {
           if (!alive) return
-          if (!payload.ok) throw new Error(payload.error ?? '读取失败')
+          if (payload.error) throw new Error(payload.error)
           setData({ messages: payload.messages ?? [], unread: Number(payload.unread ?? 0) })
         })
         .catch((err) => {

@@ -448,7 +448,7 @@ export function installTeamMode(ctx, options) {
       }
       try {
         if (!mailbox) {
-          json(res, 200, { messages: [], unread: 0 })
+          json(res, 200, { ok: true, messages: [], unread: 0 })
           return
         }
         const url = new URL(req.url ?? '/', 'http://localhost')
@@ -468,6 +468,7 @@ export function installTeamMode(ctx, options) {
         if (taskId !== '') messages = messages.filter((row) => row.taskId === taskId)
         const counts = await mailbox.unreadCounts()
         json(res, 200, {
+          ok: true,
           messages,
           unread: bot === '' ? 0 : Number(counts[bot] ?? 0),
         })
