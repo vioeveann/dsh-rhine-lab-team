@@ -288,7 +288,7 @@ test('team_dispatch_many：找不到依赖直接拒绝，不 spawn', async () =>
   }
 })
 
-test('team_dispatch：accepted 模式等验收通过，不是 ready 就放行', async () => {
+test('team_dispatch：accepted 模式不阻塞，上游验收后后台自动派', async () => {
   const { root, cleanup } = await fixture()
   try {
     const tools = fakeTools()
@@ -303,10 +303,6 @@ test('team_dispatch：accepted 模式等验收通过，不是 ready 就放行', 
       brief: { task: '采集' },
       output: '上游完成',
     })
-    setTimeout(() => {
-      const row = opts.tasks.get('t-up')
-      if (row) row.status = 'accepted'
-    }, 120)
     const def = definitionOf(tools, 'team_dispatch')
     const started = Date.now()
     const result = JSON.parse(await run(def, {
@@ -316,9 +312,45 @@ test('team_dispatch：accepted 模式等验收通过，不是 ready 就放行', 
       dependsOnMode: 'accepted',
       dependsOnTimeoutSec: 5,
     }))
-    assert.equal(result.status, 'ready')
-    assert.ok(Date.now() - started >= 400, 'ready 不该放行，要等 accepted')
+    assert.equal(result.status, 'queued')
+    assert.ok(Date.now() - started < 1000, '验收门不应该阻塞整轮调用')
     assert.equal(opts.tasks.get(result.taskId).dependsOnMode, 'accepted')
+    // 模拟秘书在工具返回后去验收上游；后台等待应该自己醒。
+    opts.tasks.get('t-up').status = 'accepted'
+    for (let i = 0; i < 40; i += 1) {
+      if (opts.tasks.get(result.taskId)?.status === 'ready') break
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.equal(opts.tasks.get(result.taskId)?.status, 'ready')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('team_dispatch_many：accepted 门也不阻塞整批，验收后自动接上', async () => {
+  const { root, cleanup } = await fixture()
+  try {
+    const tools = fakeTools()
+    const subagents = stubSubagents()
+    const opts = options(tools, root, subagents)
+    registerTeamTools({}, opts)
+    const def = definitionOf(tools, 'team_dispatch_many')
+    const started = Date.now()
+    const result = JSON.parse(await run(def, {
+      tasks: JSON.stringify([
+        { key: 'collect', bot: 'a', task: '采集' },
+        { key: 'write', bot: 'b', task: '写简报', dependsOn: ['collect'], dependsOnMode: 'accepted' },
+      ]),
+    }))
+    assert.equal(result.status, 'done')
+    assert.ok(Date.now() - started < 3000, 'accepted 门不应该把整批卡住')
+    assert.equal(result.results[1].status, 'queued')
+    opts.tasks.get(result.results[0].taskId).status = 'accepted'
+    for (let i = 0; i < 60; i += 1) {
+      if (opts.tasks.get(result.results[1].taskId)?.status === 'ready') break
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.equal(opts.tasks.get(result.results[1].taskId)?.status, 'ready')
   } finally {
     await cleanup()
   }

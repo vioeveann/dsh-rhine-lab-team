@@ -1321,6 +1321,91 @@ export function registerTeamTools(ctx, options) {
    * @param args - 任务单参数。
    * @param exec - 工具执行上下文。
    */
+  function dependenciesSatisfied(ids, mode = 'done') {
+    const list = normalizeDependsOn(ids)
+    return list.every((id) => dependencyState(tasks?.get(id), mode) === 'ok')
+  }
+
+  /**
+   * 验收门不能把秘书的整轮调用卡住：先落一条 queued，后台等上游验收。
+   * 上游 accepted 后自动派下去；失败/打回则把这件标 blocked。
+   */
+  async function deferAccepted(args, exec, bot, taskId, dependsOn, chainId) {
+    const parentSession = exec?.agent?.session?.header?.id
+    const brief = {
+      task: String(args?.task ?? ''),
+      goal: args?.goal,
+      deliverable: args?.deliverable,
+      accept: args?.accept,
+      redlines: args?.redlines,
+      materials: args?.materials,
+      retryNote: String(args?.retryNote ?? '').trim(),
+    }
+    tasks?.set(taskId, {
+      taskId,
+      bot: bot.id,
+      parentSession,
+      startedAt: Date.now(),
+      status: 'queued',
+      dependsOn,
+      dependsOnMode: 'accepted',
+      chainId,
+      model: typeof bot.model === 'string' ? bot.model : '',
+      brief,
+    })
+    void persistTasks?.()
+    options.api?.broadcast?.({ type: 'tasks' })
+    const controller = new AbortController()
+    const bgExec = { ...exec, signal: controller.signal }
+    void (async () => {
+      const ready = await waitForDependencies(dependsOn, controller.signal, 'accepted', 24 * 60 * 60 * 1000)
+      if (!ready.ok) {
+        markBlocked(taskId, bot.id, parentSession, brief, dependsOn, ready.reason, {
+          dependsOnMode: 'accepted',
+          chainId,
+        })
+        return
+      }
+      // 后台接上：不传 __batch，让并发闸正常生效；闸满就等下一轮。
+      for (let attempt = 0; attempt < 180; attempt += 1) {
+        const raw = await dispatchTask({
+          ...args,
+          bot: bot.id,
+          __taskId: taskId,
+          __fromQueue: true,
+          dependsOn,
+          dependsOnMode: 'accepted',
+          chainId,
+        }, bgExec)
+        let parsed = null
+        try {
+          parsed = JSON.parse(raw)
+        } catch {
+          parsed = null
+        }
+        if (parsed?.status === 'queued' && String(parsed?.message ?? '').includes('在跑')) {
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+          continue
+        }
+        break
+      }
+    })().catch((error) => {
+      markBlocked(taskId, bot.id, parentSession, brief, dependsOn, String(error?.message ?? error), {
+        dependsOnMode: 'accepted',
+        chainId,
+      })
+    })
+    return {
+      status: 'queued',
+      bot: bot.id,
+      taskId,
+      dependsOn,
+      dependsOnMode: 'accepted',
+      chainId,
+      message: '等上游验收通过后自动开始；秘书这轮可以先做别的。',
+    }
+  }
+
   async function dispatchTask(args, exec) {
 
       const botId = String(args?.bot ?? '').trim()
@@ -1385,7 +1470,8 @@ export function registerTeamTools(ctx, options) {
       }
       // 并行/带依赖的批量会预分配任务号，好在依赖里互相引用。
       const suppliedTaskId = String(args?.__taskId ?? '').trim()
-      if (suppliedTaskId !== '' && tasks?.has(suppliedTaskId)) {
+      const fromQueue = args?.__fromQueue === true
+      if (suppliedTaskId !== '' && tasks?.has(suppliedTaskId) && !fromQueue) {
         return JSON.stringify({ status: 'failed', error: `任务号已存在：${suppliedTaskId}` })
       }
       const taskId = suppliedTaskId || newTaskId()
@@ -1396,7 +1482,11 @@ export function registerTeamTools(ctx, options) {
       const chainId =
         String(args?.chainId ?? '').trim() ||
         (dependsOn.length > 0 ? String(tasks?.get(dependsOn[0])?.chainId ?? dependsOn[0]) : taskId)
-      if (dependsOn.length > 0) {
+      if (dependsOn.length > 0 && !fromQueue) {
+        // 验收门不能阻塞整轮：上游还没验收就先排队，后台等 accepted 再自动派。
+        if (dependsOnMode === 'accepted' && !dependenciesSatisfied(dependsOn, 'accepted')) {
+          return JSON.stringify(await deferAccepted(args, exec, bot, taskId, dependsOn, chainId))
+        }
         const queuedBrief = {
           task,
           goal: args?.goal,
@@ -2557,7 +2647,23 @@ export function registerTeamTools(ctx, options) {
               continue
             }
             // 验收门：上游跑完但还没验收，继续等；这不是失败，不要阻塞。
-            if (states.some((item) => item.state === 'pending')) continue
+            if (states.some((item) => item.state === 'pending')) {
+              // 批内上游还没落账本时先别 defer：等它先开始，下一轮再交后台等验收。
+              const depsExist = resolved.get(row.taskId).every((dep) => tasks?.has(dep))
+              if (row.mode === 'accepted' && depsExist) {
+                // 批量调用同样不能被验收门卡住：先回 queued，后台等验收后自动派。
+                pending.delete(row.taskId)
+                results[row.index] = await deferAccepted(
+                  { ...row.item, task: String(row.item?.task ?? '') },
+                  exec,
+                  { id: row.item.bot, model: row.item.model },
+                  row.taskId,
+                  resolved.get(row.taskId),
+                  chainIds.get(row.taskId),
+                )
+              }
+              continue
+            }
             pending.delete(row.taskId)
             const promise = (async () => {
               try {
