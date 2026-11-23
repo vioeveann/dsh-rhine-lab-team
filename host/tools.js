@@ -1367,6 +1367,8 @@ export function registerTeamTools(ctx, options) {
         return
       }
       // 后台接上：不传 __batch，让并发闸正常生效；闸满就等下一轮。
+      let started = false
+      let lastParsed = null
       for (let attempt = 0; attempt < 180; attempt += 1) {
         const raw = await dispatchTask({
           ...args,
@@ -1383,11 +1385,24 @@ export function registerTeamTools(ctx, options) {
         } catch {
           parsed = null
         }
+        lastParsed = parsed
         if (parsed?.status === 'queued' && String(parsed?.message ?? '').includes('在跑')) {
           await new Promise((resolve) => setTimeout(resolve, 2000))
           continue
         }
+        started = true
         break
+      }
+      // 队列里的任务必须有个结论：并发位等不到/启动直接失败，都不能永远挂在 queued。
+      const queuedRow = tasks?.get(taskId)
+      if (queuedRow?.status === 'queued') {
+        const reason = started
+          ? String(lastParsed?.error ?? lastParsed?.message ?? '后台启动失败')
+          : '一直没等到并发位，任务没有开始'
+        markBlocked(taskId, bot.id, parentSession, brief, dependsOn, reason, {
+          dependsOnMode: 'accepted',
+          chainId,
+        })
       }
     })().catch((error) => {
       markBlocked(taskId, bot.id, parentSession, brief, dependsOn, String(error?.message ?? error), {
@@ -1525,6 +1540,21 @@ export function registerTeamTools(ctx, options) {
             dependsOnMode,
             chainId,
             message: `依赖没满足：${ready.reason}`,
+          })
+        }
+      }
+      // 后台从队列接手时，先确认这件还在排队；取消/已被别的循环接走就不能再启动。
+      if (fromQueue) {
+        const existing = tasks?.get(taskId)
+        if (existing?.status === 'cancelled') {
+          return JSON.stringify({ status: 'cancelled', bot: bot.id, taskId, message: '任务已取消，不再启动' })
+        }
+        if (!existing || existing.status !== 'queued') {
+          return JSON.stringify({
+            status: 'failed',
+            bot: bot.id,
+            taskId,
+            error: `任务 ${taskId} 不在排队状态（${existing?.status ?? '不存在'}），不能从队列启动`,
           })
         }
       }
@@ -3152,7 +3182,8 @@ export function registerTeamTools(ctx, options) {
       const rows = [...(tasks?.values?.() ?? [])].filter((row) => {
         if (String(row?.chainId ?? row?.taskId) !== chainId) return false
         if (row?.doneAt) return false
-        return ['queued', 'running', 'ready'].includes(String(row?.status ?? ''))
+        // ready 是已经交活、等你验收的结果，不该被「整链取消」抹掉。
+        return ['queued', 'running'].includes(String(row?.status ?? ''))
       })
       if (rows.length === 0) return { ok: false, error: '这条链没有在跑的任务' }
       const cancelled = []

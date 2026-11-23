@@ -397,3 +397,61 @@ test('cancelChain：同一条链未结束的任务一起收掉', async () => {
     await cleanup()
   }
 })
+
+test('cancelChain：已经交活等验收的 ready 不被抹掉', async () => {
+  const { root, cleanup } = await fixture()
+  try {
+    const tools = fakeTools()
+    const subagents = stubSubagents()
+    const opts = options(tools, root, subagents)
+    registerTeamTools({}, opts)
+    opts.tasks.set('t-1', { taskId: 't-1', bot: 'a', status: 'running', chainId: 't-1', startedAt: Date.now() })
+    opts.tasks.set('t-2', {
+      taskId: 't-2',
+      bot: 'b',
+      status: 'ready',
+      chainId: 't-1',
+      startedAt: Date.now(),
+      doneAt: Date.now(),
+    })
+    const result = await opts.api.cancelChain('t-1')
+    assert.equal(result.ok, true)
+    assert.deepEqual(result.cancelled, ['t-1'])
+    assert.equal(opts.tasks.get('t-2').status, 'ready')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('取消排队的验收门任务后，上游验收也不会把它偷偷启动', async () => {
+  const { root, cleanup } = await fixture()
+  try {
+    const tools = fakeTools()
+    const subagents = stubSubagents()
+    const opts = options(tools, root, subagents)
+    registerTeamTools({}, opts)
+    opts.tasks.set('t-up', {
+      taskId: 't-up',
+      bot: 'a',
+      status: 'ready',
+      chainId: 't-up',
+      startedAt: Date.now(),
+      doneAt: Date.now(),
+    })
+    const def = definitionOf(tools, 'team_dispatch')
+    const result = JSON.parse(await run(def, {
+      bot: 'b',
+      task: '写简报',
+      dependsOn: ['t-up'],
+      dependsOnMode: 'accepted',
+    }))
+    assert.equal(result.status, 'queued')
+    await opts.api.cancel(result.taskId)
+    opts.tasks.get('t-up').status = 'accepted'
+    await new Promise((resolve) => setTimeout(resolve, 800))
+    assert.equal(opts.tasks.get(result.taskId).status, 'cancelled')
+    assert.equal(subagents.calls.filter((call) => call.bot === 'b').length, 0)
+  } finally {
+    await cleanup()
+  }
+})
