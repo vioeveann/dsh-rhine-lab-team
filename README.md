@@ -88,6 +88,16 @@ dsh plugin add https://github.com/vioeveann/dsh-rhine-lab-team
 - 排队等依赖的任务不占并发名额；DSH 重启时还没开始的 `queued` / `running` 会标 `blocked` / `failed`，并保留任务单，可用 `team_resume` 按原单重派。
 - 面板「最近任务」右侧有「依赖图」，按链画出节点和箭头，只读。
 
+## 成员信箱
+
+Bot 之间可以绕过秘书直接对齐：
+
+- `team_send`：发给团队里另一个已启用的 Bot；正文必填，可带主题、`threadId`、`taskId`。
+- `team_inbox`：看自己的收件箱；秘书可以指定 `bot` 查看某个 Bot 的信箱。
+- `team_reply`：沿已有线程回复，收件人自动判断。
+
+信是持久化的，但不会叫醒空闲 Bot：接收方下次开始任务时，未读消息会随任务单注入。秘书在面板点名字旁的小信封只能只读查看，不算 Bot 已读；只有 Bot 自己调用 `team_inbox` 才标已读。第一版没有回复框，Bot 看完仍把结论写回任务结果。
+
 ## 反馈
 
 遇到 bug、觉得哪里不好用，欢迎开 Issue：<https://github.com/vioeveann/dsh-rhine-lab-team/issues>。也欢迎直接提意见，不用客气。

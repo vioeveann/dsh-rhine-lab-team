@@ -1357,7 +1357,201 @@ function createMembersPanel(React, host) {
     )
   }
 
-  const PanelMemberCard = React.memo(function PanelMemberCard({ member, onOpen, onOpenSession, hint, onSettings, onPromote, onArchive, onRemove }) {
+  function MailEnvelope({ count = 0, onClick }) {
+    const [node, setNode] = React.useState(null)
+    const [previous, setPrevious] = React.useState(count)
+    const [lastShake, setLastShake] = React.useState(0)
+    const unread = count > 0
+    const shake = () => {
+      if (!node || typeof node.animate !== 'function') return
+      if (globalThis.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches) return
+      const now = Date.now()
+      if (now - lastShake < 10000) return
+      setLastShake(now)
+      node.animate(
+        [
+          { transform: 'rotate(0deg)' },
+          { transform: 'rotate(-5deg)' },
+          { transform: 'rotate(5deg)' },
+          { transform: 'rotate(-3deg)' },
+          { transform: 'rotate(0deg)' },
+        ],
+        { duration: 700, easing: 'ease-in-out' },
+      )
+    }
+    React.useEffect(() => {
+      if (!node) return
+      if (count > previous) shake()
+      if (count !== previous) setPrevious(count)
+    }, [count, node, previous])
+    const color = unread ? '#B44836' : '#8C9187'
+    return h(
+      'button',
+      {
+        ref: setNode,
+        type: 'button',
+        title: unread ? `${count} 条未读消息` : '没有未读消息',
+        'aria-label': unread ? `${count} 条未读消息` : '没有未读消息',
+        onClick: (event) => {
+          event.stopPropagation()
+          onClick?.()
+        },
+        onMouseEnter: shake,
+        style: {
+          flex: '0 0 auto',
+          width: 20,
+          height: 20,
+          padding: 0,
+          border: 0,
+          background: 'transparent',
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          cursor: 'pointer',
+          opacity: unread ? 1 : 0.45,
+          color,
+          transformOrigin: '50% 50%',
+        },
+      },
+      h(
+        'svg',
+        { width: 14, height: 11, viewBox: '0 0 14 11', 'aria-hidden': true, style: { display: 'block' } },
+        h('rect', {
+          x: 0.7,
+          y: 0.7,
+          width: 12.6,
+          height: 9.6,
+          rx: 1.4,
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 1.4,
+        }),
+        h('path', {
+          d: 'M1.4 2.2 L7 6.3 L12.6 2.2',
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 1.4,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+        }),
+      ),
+    )
+  }
+
+  function TaskMailThread({ taskId, p }) {
+    const [messages, setMessages] = React.useState([])
+    React.useEffect(() => {
+      let alive = true
+      fetch(`/dsh-team/mailbox?taskId=${encodeURIComponent(taskId)}&limit=50`)
+        .then((response) => response.json())
+        .then((payload) => {
+          if (alive && payload.ok) setMessages(payload.messages ?? [])
+        })
+        .catch(() => {})
+      return () => {
+        alive = false
+      }
+    }, [taskId])
+    if (messages.length === 0) return null
+    return h(
+      'div',
+      { style: { marginTop: 10, paddingTop: 8, borderTop: `1px solid ${p.line}` } },
+      h(
+        'div',
+        { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: p.dim } },
+        h(MailEnvelope, { count: 0, onClick: () => {} }),
+        `消息 ${messages.length}`,
+      ),
+      messages.map((message) => h(
+        'div',
+        { key: message.id, style: { marginTop: 8, fontSize: 11, lineHeight: 1.6 } },
+        h('div', { style: { color: p.faint } }, `${message.from} → ${message.to}${message.subject ? ` · ${message.subject}` : ''}`),
+        h('div', { style: { whiteSpace: 'pre-wrap', color: p.text } }, message.body),
+      )),
+    )
+  }
+
+  function MailboxDialog({ bot, p, onClose }) {
+    const [data, setData] = React.useState({ messages: [], unread: 0 })
+    const [error, setError] = React.useState('')
+    React.useEffect(() => {
+      let alive = true
+      setError('')
+      fetch(`/dsh-team/mailbox?bot=${encodeURIComponent(bot?.id ?? '')}&limit=20`)
+        .then((response) => response.json())
+        .then((payload) => {
+          if (!alive) return
+          if (!payload.ok) throw new Error(payload.error ?? '读取失败')
+          setData({ messages: payload.messages ?? [], unread: Number(payload.unread ?? 0) })
+        })
+        .catch((err) => {
+          if (alive) setError(String(err?.message ?? err))
+        })
+      return () => {
+        alive = false
+      }
+    }, [bot?.id])
+    const shown = data.messages.slice(0, 3)
+    return h(
+      'div',
+      {
+        style: {
+          position: 'fixed',
+          inset: 0,
+          zIndex: 1000,
+          background: 'rgba(20,24,22,0.35)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: 24,
+        },
+        onClick: onClose,
+      },
+      h(
+        'div',
+        {
+          onClick: (event) => event.stopPropagation(),
+          style: {
+            width: 520,
+            maxWidth: '100%',
+            maxHeight: '70vh',
+            overflow: 'auto',
+            background: p.surface,
+            border: `1px solid ${p.line}`,
+            borderRadius: 8,
+            boxShadow: '0 18px 50px rgba(20,24,22,0.28)',
+            padding: 18,
+            color: p.text,
+          },
+        },
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+          h(MailEnvelope, { count: data.unread, onClick: () => {} }),
+          h('strong', { style: { fontSize: 14 } }, `${bot?.name ?? bot?.id} 的信箱`),
+          data.unread > 0 ? h('span', { style: { fontSize: 11, color: '#B44836' } }, `${data.unread} 条未读`) : null,
+          h('button', {
+            type: 'button',
+            onClick: onClose,
+            style: { marginLeft: 'auto', border: 0, background: 'transparent', color: p.dim, cursor: 'pointer', fontSize: 16 },
+            'aria-label': '关闭',
+          }, '×'),
+        ),
+        h('div', { style: { marginTop: 4, fontSize: 10.5, color: p.faint } }, '只读。Bot 下次开始任务时才会读到；这里的查看不算已读。'),
+        error ? h('div', { style: { marginTop: 12, color: '#B44836', fontSize: 12 } }, error) : null,
+        !error && shown.length === 0 ? h('div', { style: { marginTop: 18, color: p.faint, fontSize: 12 } }, '还没有消息。') : null,
+        shown.map((message) => h(
+          'div',
+          { key: message.id, style: { marginTop: 12, paddingTop: 10, borderTop: `1px solid ${p.line}` } },
+          h('div', { style: { fontSize: 11, color: p.dim } }, `${message.from} → ${message.to}${message.subject ? ` · ${message.subject}` : ''}`),
+          h('div', { style: { marginTop: 4, fontSize: 12, lineHeight: 1.6, whiteSpace: 'pre-wrap' } }, message.body),
+        )),
+        data.messages.length > 3 ? h('div', { style: { marginTop: 10, fontSize: 10.5, color: p.faint } }, `还有 ${data.messages.length - 3} 条，先看最近三条。`) : null,
+      ),
+    )
+  }
+
+  const PanelMemberCard = React.memo(function PanelMemberCard({ member, onOpen, onOpenSession, onOpenMailbox, hint, onSettings, onPromote, onArchive, onRemove }) {
     const skin = useSkin()
     const p = palette()
     const aurora = false
@@ -1482,6 +1676,10 @@ function createMembersPanel(React, host) {
             },
             member?.name || member?.id,
           ),
+          h(MailEnvelope, {
+            count: Number(member?.unread) || 0,
+            onClick: () => onOpenMailbox?.(member),
+          }),
           // 「限定」自带 Bot：名字后面挂一个小标签（暖色渐变 + 落影，衬线字）。
           member?.limited
             ? h(
@@ -5068,6 +5266,7 @@ function createMembersPanel(React, host) {
     const [revision, setRevision] = React.useState(0)
     const [boardOpen, setBoardOpen] = React.useState(false)
     const [graphOpen, setGraphOpen] = React.useState(false)
+    const [mailboxBot, setMailboxBot] = React.useState(null)
     const [allTasks, setAllTasks] = React.useState([])
     const [boardFilter, setBoardFilter] = React.useState('all')
 
@@ -5707,6 +5906,7 @@ function createMembersPanel(React, host) {
                     hint: noSessionHint === member.id,
                     onOpen: (target) => openChat(target),
                     onOpenSession: openChat,
+                    onOpenMailbox: (target) => setMailboxBot(target),
                     onSettings: (target) => setInlineEdit((current) => (current === target?.id ? null : target?.id)),
                     onPromote: (target) => setPromoteBot(target),
                     onArchive: (target) => setGrowthBot(target),
@@ -5905,6 +6105,7 @@ function createMembersPanel(React, host) {
           detail.brief?.task ? h('div', null, `任务单：${detail.brief.task}`) : null,
           detail.dependsOn?.length ? h('div', null, `依赖${detail.dependsOnMode === 'accepted' ? '（验收后放行）' : ''}：${detail.dependsOn.join('、')}`) : null,
           detail.blockedBy ? h('div', { style: { color: p.warn } }, `阻塞：${detail.blockedBy}`) : null,
+          h(TaskMailThread, { taskId: detail.taskId, p }),
           detail.brief?.accept ? h('div', null, `验收：${detail.brief.accept}`) : null,
           detail.brief?.redlines ? h('div', null, `红线：${detail.brief.redlines}`) : null,
           detail.cwd ? h('div', { style: { wordBreak: 'break-all' } }, `目录：${detail.cwd}`) : null,
@@ -6305,6 +6506,7 @@ function createMembersPanel(React, host) {
         : null,
       promoteDialog,
       growthDialog,
+      mailboxBot ? h(MailboxDialog, { bot: mailboxBot, p, onClose: () => setMailboxBot(null) }) : null,
       graphOpen ? h(TaskGraphDialog, { tasks: allTasks, onClose: () => setGraphOpen(false), p }) : null,
     )
   }

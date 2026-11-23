@@ -19,6 +19,7 @@ import { ensureBuiltinBots } from './builtin-bots.js'
 import { installTeamMode, readRoster } from './team-mode.js'
 import { loadSettings, resolveDeliverableRoot, saveSettings } from './settings.js'
 import { createUsageBook } from './usage.js'
+import { createMailbox } from './mailbox.js'
 import { migrateDataRoot, resolveDataRoot } from './paths.js'
 
 /** 插件包目录：只放代码，不放数据。升级时它会被整个替换。 */
@@ -45,6 +46,8 @@ const pending = new Map()
 /** Live and recently finished tasks, keyed by task id. */
 const tasks = new Map()
 const TASKS_FILE = join(ROOT, '.state', 'tasks.json')
+/** Bot 之间的持久信箱；秘书可以读，但不能作为收件人。 */
+const mailbox = createMailbox({ root: ROOT })
 
 /** 每个子会话已经烧掉的真实 token，结算时由派活/单聊领走。 */
 const usageBook = createUsageBook()
@@ -281,9 +284,10 @@ export async function apply(ctx, config = {}) {
       root: ROOT,
       debug,
       tasks,
+      mailbox,
       api: TEAM_API,
       persistTasks,
-      getRoster: ({ sessionId }) => readRoster({ root: ROOT, tasks, sessionId }),
+      getRoster: ({ sessionId }) => readRoster({ root: ROOT, tasks, sessionId, mailbox }),
       getInstanceConflict: () => instanceConflict,
       // 面板里的「模型」要能列出真正可调用的模型，而不是让人手填。
       getModels: async () => {
@@ -342,6 +346,7 @@ export async function apply(ctx, config = {}) {
       debug,
       pending,
       tasks,
+      mailbox,
       usageBook: usage,
       deliverableRoot: DELIVERABLES,
       getDeliverableRoot: () => resolveDeliverableRoot(ROOT, SETTINGS, process.env.DSH_TEAM_DELIVERABLES),

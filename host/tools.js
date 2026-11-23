@@ -33,6 +33,7 @@ import { confirmImprovement, promoteBot, savePromotionSpeech, updateGrowth } fro
 import { growthDetail, growthSummary, promote, regrade, settleRepeat, settleTask, settleTeaching } from './growth.js'
 import { taskGain } from './progress.js'
 import { loadBots, stripSoulPlaceholder } from './bots.js'
+import { formatMailPrompt } from './mailbox.js'
 
 /** 插件自带审计员的 id；打 excellent 前必须先有它的审计记录。 */
 const AUDITOR_ID = 'auditor'
@@ -1184,7 +1185,7 @@ export function canStartTask(tasks, sessionId, limit) {
  * @returns the tools disposer.
  */
 export function registerTeamTools(ctx, options) {
-  const { root, tools, agents, subagents, debug, pending, tasks, isTeamSession, persistTasks, usageBook } = options
+  const { root, tools, agents, subagents, debug, pending, tasks, mailbox, isTeamSession, persistTasks, usageBook } = options
 
   /**
    * 怎么称呼用户：设置里的 address，默认「你」。
@@ -1203,6 +1204,44 @@ export function registerTeamTools(ctx, options) {
 
   /** 任务号：并行派活时同一毫秒可能起两件，随机尾必须带。 */
   const newTaskId = () => `t-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+
+  /** 当前会话属于哪个 Bot：子会话的 sessionId 在账本里。 */
+  function botOfSession(sessionId) {
+    if (!sessionId) return ''
+    let hit = ''
+    for (const entry of tasks?.values?.() ?? []) {
+      if (entry.sessionId !== sessionId) continue
+      if (!entry.bot) continue
+      // 同一会话只会属于一个 Bot；优先取最近一条，避免历史行误判。
+      if (!hit) hit = entry.bot
+    }
+    return hit
+  }
+
+  /** 信箱身份：Bot 用 id，秘书用 secretary。 */
+  function mailboxIdentity(exec) {
+    const sessionId = exec?.agent?.session?.header?.id
+    const bot = botOfSession(sessionId)
+    if (bot) return bot
+    return isTeamSession?.(sessionId) ? 'secretary' : ''
+  }
+
+  /** 信箱工具只对 Bot 子会话和秘书会话开放。 */
+  const mailboxWhen = ({ agent }) => {
+    const sessionId = agent?.session?.header?.id
+    if (!sessionId) return false
+    return Boolean(botOfSession(sessionId)) || Boolean(isTeamSession?.(sessionId))
+  }
+
+  /** 收件人必须是团队内已启用的 Bot。 */
+  async function readRecipient(botId) {
+    const id = String(botId ?? '').trim()
+    if (!id) return null
+    const bots = await loadBots(root)
+    const bot = bots.find((item) => item.id === id)
+    if (!bot || bot.status === 'disabled') return null
+    return bot
+  }
 
   /**
    * 把一件活标成「受阻」：账本留痕，面板能看见为什么没跑。
@@ -1441,7 +1480,13 @@ export function registerTeamTools(ctx, options) {
       const retryNote = String(args?.retryNote ?? '').trim()
       const retryBlock = retryNote === '' ? '' : `\n\n上一轮打回原因（必须逐条处理）：\n${retryNote}`
       const auditBlock = bot.id === AUDITOR_ID ? AUDIT_BRIEF : ''
-      const brief = buildTaskPrompt({ ...args, task }) + handoffNote + retryBlock + auditBlock
+      let mailBlock = ''
+      try {
+        mailBlock = formatMailPrompt(await mailbox?.takeForPrompt?.(bot.id, 5))
+      } catch (error) {
+        await debug?.({ event: 'mailbox-prompt', ok: false, bot: bot.id, error: String(error?.message ?? error) })
+      }
+      const brief = buildTaskPrompt({ ...args, task }) + handoffNote + retryBlock + auditBlock + mailBlock
       if (!brief) {
         return JSON.stringify({ status: 'failed', error: '任务单是空的' })
       }
@@ -2154,6 +2199,127 @@ export function registerTeamTools(ctx, options) {
       return raw
     }
   }
+
+  // 成员信箱：Bot 之间直接对齐，不再让所有话都经秘书转。
+  const mailboxSend = tools.register({
+      name: 'team_send',
+      description: '给团队里的另一个 Bot 发一条持久消息。不能发给自己，也不能发给用户；秘书可以发给 Bot。',
+      parameters: {
+        to: { type: 'string', required: true, description: '收件 Bot id' },
+        body: { type: 'string', required: true, description: '正文' },
+        subject: { type: 'string', description: '主题（可省略）' },
+        threadId: { type: 'string', description: '回复时带上原 threadId' },
+        taskId: { type: 'string', description: '关联任务号（可省略）' },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_args, value) => [{ type: 'text', text: String(value) }],
+      },
+      when: mailboxWhen,
+      async execute(args, exec) {
+        try {
+          const from = mailboxIdentity(exec)
+          if (!from) return JSON.stringify({ ok: false, error: '当前会话不是团队成员' })
+          const to = String(args?.to ?? '').trim()
+          if (to === 'secretary' || to === 'user') {
+            return JSON.stringify({ ok: false, error: '信箱只收 Bot 之间的消息，不能发给秘书或用户' })
+          }
+          const recipient = await readRecipient(to)
+          if (!recipient) return JSON.stringify({ ok: false, error: `没有这个 Bot，或它已停用：${to}` })
+          const result = await mailbox.send({
+            from,
+            to,
+            subject: args?.subject,
+            body: args?.body,
+            threadId: args?.threadId,
+            taskId: args?.taskId,
+          })
+          return JSON.stringify(result)
+        } catch (error) {
+          return JSON.stringify({ ok: false, error: String(error?.message ?? error) })
+        }
+      },
+    })
+
+  const mailboxInbox = tools.register({
+      name: 'team_inbox',
+      description: '查看自己的成员信箱；秘书要指定 bot 才能看某个 Bot 的信箱。默认把取到的消息标为已读（秘书查看不算 Bot 已读）。',
+      parameters: {
+        bot: { type: 'string', description: '秘书查看某个 Bot 时填；Bot 自己调用不用填' },
+        unreadOnly: { type: 'boolean', description: '只看未读' },
+        limit: { type: 'number', description: '最多几条，默认 20' },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_args, value) => [{ type: 'text', text: String(value) }],
+      },
+      when: mailboxWhen,
+      async execute(args, exec) {
+        try {
+          const identity = mailboxIdentity(exec)
+          if (!identity) return JSON.stringify({ ok: false, error: '当前会话不是团队成员' })
+          const target = identity === 'secretary' ? String(args?.bot ?? '').trim() : identity
+          if (!target) return JSON.stringify({ ok: false, error: '秘书查看信箱要指定 bot' })
+          const limit = Math.max(1, Math.min(50, Number(args?.limit) || 20))
+          const messages = await mailbox.inbox(target, { unreadOnly: args?.unreadOnly === true, limit })
+          if (identity !== 'secretary' && args?.unreadOnly !== true && messages.length > 0) {
+            await mailbox.markRead(target, messages.map((row) => row.id))
+          }
+          const counts = await mailbox.unreadCounts()
+          return JSON.stringify({ ok: true, bot: target, messages, unread: Number(counts[target] ?? 0) })
+        } catch (error) {
+          return JSON.stringify({ ok: false, error: String(error?.message ?? error) })
+        }
+      },
+    })
+
+  const mailboxReply = tools.register({
+      name: 'team_reply',
+      description: '回复一条已有信箱线程。收件人从线程里自动判断，不用手填。',
+      parameters: {
+        threadId: { type: 'string', required: true, description: '线程号，team_inbox 会带出来' },
+        body: { type: 'string', required: true, description: '回复正文' },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_args, value) => [{ type: 'text', text: String(value) }],
+      },
+      when: mailboxWhen,
+      async execute(args, exec) {
+        try {
+          const identity = mailboxIdentity(exec)
+          if (!identity) return JSON.stringify({ ok: false, error: '当前会话不是团队成员' })
+          const threadId = String(args?.threadId ?? '').trim()
+          if (!threadId) return JSON.stringify({ ok: false, error: 'threadId 不能为空' })
+          const rows = await mailbox.thread(threadId)
+          if (rows.length === 0) return JSON.stringify({ ok: false, error: `没有这个线程：${threadId}` })
+          let to = ''
+          for (let i = rows.length - 1; i >= 0; i -= 1) {
+            const row = rows[i]
+            if (row.to === identity) { to = row.from; break }
+            if (row.from === identity) { to = row.to; break }
+          }
+          if (!to || to === identity) return JSON.stringify({ ok: false, error: '线程里找不到可回复的对方' })
+          if (to === 'secretary' || to === 'user') {
+            return JSON.stringify({ ok: false, error: '不能回复秘书或用户；请把结论写回任务结果' })
+          }
+          const recipient = await readRecipient(to)
+          if (!recipient) return JSON.stringify({ ok: false, error: `对方已不在团队里或已停用：${to}` })
+          const source = rows.find((row) => row.to === identity) ?? rows[rows.length - 1]
+          const result = await mailbox.send({
+            from: identity,
+            to,
+            subject: source?.subject ? `回复：${source.subject}` : '回复',
+            body: args?.body,
+            threadId,
+            taskId: source?.taskId,
+          })
+          return JSON.stringify(result)
+        } catch (error) {
+          return JSON.stringify({ ok: false, error: String(error?.message ?? error) })
+        }
+      },
+  })
 
   // 按原任务单重派：复用 dispatchTask，要求不用再写一遍。
   const teachTools = tools.register(
@@ -3419,6 +3585,9 @@ export function registerTeamTools(ctx, options) {
     disposeBatch()
     disposePlan()
     disposeReview()
+    mailboxSend()
+    mailboxInbox()
+    mailboxReply()
     retryTools()
     cancelTools()
     assignTools()

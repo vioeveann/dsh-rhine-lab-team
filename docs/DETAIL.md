@@ -84,6 +84,12 @@ node --check host/*.js
 
 调度是 DAG-lite：同一批内部按拓扑顺序跑，就绪的任务按并发上限并行；默认上游 `ready` 或 `accepted` 就放行，`dependsOnMode: 'accepted'` 时上游必须验收通过。上游 `failed` / `rejected` / `timeout` / `blocked`，下游直接写 `blocked` 账本行，不 spawn。等外部依赖超过 `max(60s, 2×单任务超时)` 会整批标 blocked，不无限挂住。批量可传 `chainTimeoutSec`，整链超时后未开始的下游标 blocked；`team_cancel` 传 `chain: true` 整链中止。重启时没开始的 `queued` 转 `blocked`、`running` 转 `failed`，都带 `restartInterrupted`，`team_resume` 可按原任务单重派。
 
+## 成员信箱
+
+成员之间可以直接发信，不再所有对齐都经秘书转。消息存在 `$DSH_HOME/rhine-lab-team/mailbox/messages.jsonl`，带 `from/to/subject/body/threadId/taskId/read`；`team_send` 发、`team_inbox` 读、`team_reply` 沿线程回。收件人必须是团队里已启用的 Bot；秘书可发，不能作为收件人；每人每小时最多 20 条。
+
+信箱是持久的，但默认不唤醒空闲 Bot：`dispatchTask` 在拼任务单时把该 Bot 最多 5 条未读取出来并标读，随任务注入。秘书在面板打开成员信箱是只读的，不替 Bot 标读；只有 Bot 自己调用 `team_inbox` 才算已读。第一版没有 UI 回复框，避免秘书替 Bot 说话。
+
 ## 预算与体检
 
 `team_health` 一眼看完：几件在跑、几件等你验收、有没有卡住、卡在哪几件。挡派活的是并发上限（默认 3）和单件超时（默认 600 秒），没有按小时的字数闸门——那套东西在 2026-11-20 拆掉了：实测从没触发过（单件最大 260 字，滚动一小时峰值 916 字，上限 16 万字），它看不见在跑的任务，而且字数跟成本没关系。要估成本看卡片上的真实 token。

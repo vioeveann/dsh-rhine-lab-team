@@ -25,6 +25,7 @@ const ROSTER_ROUTE = '/dsh-team/roster'
 const TASKS_ROUTE = '/dsh-team/tasks'
 /** 单件任务：member 卡片用它同步真实状态（卡里的状态是写死的历史文本）。 */
 const TASK_ROUTE = '/dsh-team/task'
+const MAILBOX_ROUTE = '/dsh-team/mailbox'
 const BOTS_ROUTE = '/dsh-team/bots'
 const MEMORY_ROUTE = '/dsh-team/memory'
 const PERSONA_ROUTE = '/dsh-team/persona'
@@ -190,7 +191,7 @@ export function isStuck(entry, now = Date.now(), thresholdMs = 10 * 60_000) {
  * @param options - `{ root, debug, tasks, getRoster }`.
  */
 export function installTeamMode(ctx, options) {
-  const { root, debug, tasks, getRoster, getSettings, saveSettings, api, persistTasks, getModels, getInstanceConflict } = options
+  const { root, debug, tasks, mailbox, getRoster, getSettings, saveSettings, api, persistTasks, getModels, getInstanceConflict } = options
   const storeFile = join(root, '.state', 'team-mode.json')
 
   /** 在线的 SSE 客户端。 */
@@ -429,6 +430,46 @@ export function installTeamMode(ctx, options) {
             startedAt: entry.startedAt ?? null,
             doneAt: entry.doneAt ?? null,
           },
+        })
+      } catch (error) {
+        json(res, 500, { error: String(error?.message ?? error) })
+      }
+    },
+  })
+
+  const disposeMailbox = registerRoute({
+    kind: 'exact',
+    path: MAILBOX_ROUTE,
+    async handler(req, res) {
+      if (req.method !== 'GET') {
+        res.writeHead(405, { allow: 'GET' })
+        res.end()
+        return
+      }
+      try {
+        if (!mailbox) {
+          json(res, 200, { messages: [], unread: 0 })
+          return
+        }
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const threadId = String(url.searchParams.get('threadId') ?? '').trim()
+        const bot = String(url.searchParams.get('bot') ?? '').trim()
+        const taskId = String(url.searchParams.get('taskId') ?? '').trim()
+        const limit = Number(url.searchParams.get('limit') ?? 50) || 50
+        let messages = []
+        if (threadId !== '') {
+          messages = await mailbox.thread(threadId)
+        } else if (bot !== '') {
+          messages = await mailbox.inbox(bot, { limit })
+        } else {
+          json(res, 400, { error: '要 bot 或 threadId' })
+          return
+        }
+        if (taskId !== '') messages = messages.filter((row) => row.taskId === taskId)
+        const counts = await mailbox.unreadCounts()
+        json(res, 200, {
+          messages,
+          unread: bot === '' ? 0 : Number(counts[bot] ?? 0),
         })
       } catch (error) {
         json(res, 500, { error: String(error?.message ?? error) })
@@ -1516,6 +1557,7 @@ export function installTeamMode(ctx, options) {
       disposeRoster()
       disposeTasks()
       disposeTaskOne()
+      disposeMailbox()
       disposeBots()
       disposeEvents()
       disposeTemplates()
@@ -1551,7 +1593,7 @@ export function installTeamMode(ctx, options) {
  * @returns member rows for the panel.
  */
 export async function readRoster(options) {
-  const { root, tasks, sessionId } = options
+  const { root, tasks, sessionId, mailbox } = options
   let files = []
   try {
     files = (await readdir(join(root, 'bots'))).filter((name) => name.endsWith('.json'))
@@ -1583,6 +1625,12 @@ export async function readRoster(options) {
   }
 
   const members = []
+  let unread = {}
+  try {
+    unread = (await mailbox?.unreadCounts?.()) ?? {}
+  } catch {
+    unread = {}
+  }
   for (const file of files) {
     let bot
     try {
@@ -1602,6 +1650,7 @@ export async function readRoster(options) {
       builtin: BUILTIN_BOTS.some((entry) => entry.id === bot.id),
       limited: BUILTIN_BOTS.some((entry) => entry.id === bot.id && entry.limited === true),
       note: bot.note ?? '',
+      unread: Number(unread[bot.id] ?? 0),
       enabled: bot.status !== 'disabled',
       tasks: running.length,
       since: running[0]?.startedAt ?? null,
