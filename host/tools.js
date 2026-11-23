@@ -1102,6 +1102,8 @@ export function activeTaskCount(tasks, sessionId) {
     if (entry.doneAt) continue
     // 排队等依赖的任务不占并发名额：它还没起子会话。
     if (entry.status === 'queued') continue
+    // blocked 也没有句柄：等上游验收后由 wakeBlocked 重新拉起。
+    if (entry.status === 'blocked') continue
     // 重启时中断的任务没有句柄，恢复前也不占名额。
     if (entry.status === 'interrupted') continue
     if (entry.parentSession !== sessionId) continue
@@ -1686,7 +1688,7 @@ export function registerTeamTools(ctx, options) {
         if (existing?.status === 'cancelled') {
           return JSON.stringify({ status: 'cancelled', bot: bot.id, taskId, message: '任务已取消，不再启动' })
         }
-        if (!existing || existing.status !== 'queued') {
+        if (!existing || !['queued', 'blocked'].includes(existing.status)) {
           return JSON.stringify({
             status: 'failed',
             bot: bot.id,
@@ -2278,20 +2280,51 @@ export function registerTeamTools(ctx, options) {
       `任务单：${entry?.brief?.task ?? ''}`,
       '沿用你这个目录里已有的文件改，不要重开一份；改完写清楚改了哪几处。',
     ].join('\n')
-    const continued = await continueTask(
-      entry,
-      { prompt, brief: { ...entry.brief, retryNote: note }, retried: true },
+    const canContinue = Boolean(entry.sessionId)
+      && !['blocked', 'failed', 'queued', 'interrupted'].includes(entry.status)
+    let continued = null
+    if (canContinue) {
+      continued = await continueTask(
+        entry,
+        { prompt, brief: { ...entry.brief, retryNote: note }, retried: true },
+        exec,
+      )
+      if (continued && continued.status !== 'failed') return JSON.stringify(continued)
+      if (continued) {
+        await debug?.({ event: 'continue-fallback', from: entry.taskId, error: continued.error })
+      }
+    }
+    const raw = await dispatchTask(
+      {
+        ...entry.brief,
+        bot: entry.bot,
+        dependsOn: entry.dependsOn,
+        dependsOnMode: entry.dependsOnMode,
+        chainId: entry.chainId,
+        review: entry.review === true,
+        retryNote: note,
+      },
       exec,
     )
-    if (continued && continued.status !== 'failed') return JSON.stringify(continued)
-    if (continued) {
-      await debug?.({ event: 'continue-fallback', from: entry.taskId, error: continued.error })
-    }
-    const raw = await dispatchTask({ ...entry.brief, bot: entry.bot, retryNote: note }, exec)
     try {
       const parsed = JSON.parse(raw)
       parsed.retriedFrom = entry.taskId
       if (continued) parsed.continueError = continued.error
+      const nextId = String(parsed?.taskId ?? '').trim()
+      if (nextId !== '' && nextId !== entry.taskId) {
+        entry.supersededBy = nextId
+        const fresh = tasks?.get(nextId)
+        if (fresh) fresh.continuesFrom = entry.taskId
+        // 下游原来依赖旧任务号，重派后要改指新任务，否则会一直等一个不会再完成的任务。
+        const mapping = new Map([[entry.taskId, nextId]])
+        for (const row of tasks?.values?.() ?? []) {
+          if (Array.isArray(row?.dependsOn) && row.dependsOn.includes(entry.taskId)) {
+            row.dependsOn = remapDependsOn(row.dependsOn, mapping)
+          }
+        }
+        void persistTasks?.()
+        options.api?.broadcast?.({ type: 'tasks' })
+      }
       return JSON.stringify(parsed)
     } catch {
       return raw
@@ -3229,6 +3262,52 @@ export function registerTeamTools(ctx, options) {
     },
   )
 
+  // 上游验收通过后，把因为「等依赖超时/链超时」而 blocked 的下游叫醒。
+  // 只叫醒依赖已经满足、父会话还在、并发位也够的那些，避免一次拉起一大片。
+  async function wakeBlocked({ dependencyTaskId = '', chainId = '', exec } = {}) {
+    const woke = []
+    const rows = [...(tasks?.values?.() ?? [])].filter((row) => {
+      if (row?.status !== 'blocked' || row?.supersededBy) return false
+      if (chainId !== '' && row.chainId !== chainId) return false
+      if (dependencyTaskId !== '' && !(row.dependsOn ?? []).includes(dependencyTaskId)) return false
+      return true
+    })
+    for (const row of rows) {
+      if (!row.parentSession) continue
+      if (!dependenciesSatisfied(row.dependsOn, row.dependsOnMode ?? 'done')) continue
+      const gate = canStartTask(tasks, row.parentSession, maxConcurrent())
+      if (!gate.ok) break
+      const brief = row.brief ?? {}
+      const raw = await dispatchTask(
+        {
+          ...brief,
+          bot: row.bot,
+          dependsOn: row.dependsOn,
+          dependsOnMode: row.dependsOnMode,
+          chainId: row.chainId,
+          review: row.review === true,
+          __taskId: row.taskId,
+          __fromQueue: true,
+        },
+        exec,
+      )
+      const parsed = parseToolJson(raw)
+      if (parsed?.status === 'failed') {
+        row.status = 'blocked'
+        row.note = `自动唤醒失败：${parsed.error ?? '未知错误'}`
+        woke.push({ taskId: row.taskId, status: 'blocked', error: parsed.error })
+      } else {
+        woke.push({ taskId: row.taskId, status: parsed?.status ?? 'running' })
+      }
+    }
+    if (woke.length > 0) {
+      void persistTasks?.()
+      options.api?.broadcast?.({ type: 'tasks' })
+      await debug?.({ event: 'wake-blocked', dependencyTaskId, chainId, woke })
+    }
+    return woke
+  }
+
   // The gate: a bot stops at "ready"; the secretary inspects the artifact and
   // records accepted or rejected. Nothing else may flip that verdict.
   const disposeReview = tools.register(
@@ -3254,7 +3333,7 @@ export function registerTeamTools(ctx, options) {
         schema: { type: 'string' },
         render: (_args, value) => [{ type: 'text', text: String(value) }],
       },
-      async execute(args) {
+      async execute(args, exec) {
         const taskId = String(args?.taskId ?? '').trim()
         const verdict = String(args?.verdict ?? '').trim()
         const note = String(args?.note ?? '').trim()
@@ -3386,6 +3465,13 @@ export function registerTeamTools(ctx, options) {
 
         void persistTasks?.()
         await debug?.({ event: 'review', taskId, verdict, note, growth: growthNote })
+        if (verdict === 'accepted') {
+          try {
+            await wakeBlocked({ dependencyTaskId: taskId, exec })
+          } catch (error) {
+            await debug?.({ event: 'wake-blocked-failed', taskId, error: String(error?.message ?? error) })
+          }
+        }
         return JSON.stringify({ ok: true, taskId, verdict, bot: entry.bot, growth: growthNote })
       },
     },
@@ -3417,7 +3503,7 @@ export function registerTeamTools(ctx, options) {
         schema: { type: 'string' },
         render: (_args, value) => [{ type: 'text', text: String(value) }],
       },
-      async execute(args) {
+      async execute(args, exec) {
         const taskId = String(args?.taskId ?? '').trim()
         const signal = String(args?.signal ?? '').trim()
         const note = String(args?.note ?? '').trim()
@@ -3476,6 +3562,13 @@ export function registerTeamTools(ctx, options) {
         options.api?.broadcast?.({ type: 'roster' })
         void persistTasks?.()
         await debug?.({ event: 'user-feedback', taskId, bot: entry.bot, signal, grade })
+        if (grade === 'excellent') {
+          try {
+            await wakeBlocked({ dependencyTaskId: taskId, exec })
+          } catch (error) {
+            await debug?.({ event: 'wake-blocked-failed', taskId, error: String(error?.message ?? error) })
+          }
+        }
         return JSON.stringify({ ok: true, taskId, bot: entry.bot, signal, grade, growth: growthNote, repeat: repeatNote })
       },
     },

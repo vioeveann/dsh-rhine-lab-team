@@ -5119,10 +5119,16 @@ function createMembersPanel(React, host) {
       if (!byChain.has(chainId)) byChain.set(chainId, [])
       byChain.get(chainId).push(task)
     }
-    const chains = [...byChain.values()]
-    const withEdges = chains.filter((list) => list.some((task) => (task.dependsOn ?? []).length > 0))
-    const picked = (withEdges.length > 0 ? withEdges : chains)
-      .sort((a, b) => Math.max(...b.map((t) => t.startedAt ?? 0)) - Math.max(...a.map((t) => t.startedAt ?? 0)))[0] ?? []
+    const chains = [...byChain.entries()]
+      .map(([chainId, list]) => ({ chainId, list }))
+      .sort((a, b) => Math.max(...b.list.map((t) => t.startedAt ?? 0)) - Math.max(...a.list.map((t) => t.startedAt ?? 0)))
+    const withEdges = chains.filter(({ list }) => list.some((task) => (task.dependsOn ?? []).length > 0))
+    const defaultChain = (withEdges.length > 0 ? withEdges : chains)[0]?.chainId ?? ''
+    const [selectedChain, setSelectedChain] = React.useState('')
+    const [ending, setEnding] = React.useState(false)
+    const [endNote, setEndNote] = React.useState('')
+    const activeChain = byChain.has(selectedChain) ? selectedChain : defaultChain
+    const picked = byChain.get(activeChain) ?? []
     const ids = new Set(picked.map((task) => task.taskId))
     const edges = []
     for (const task of picked) {
@@ -5199,14 +5205,58 @@ function createMembersPanel(React, host) {
         },
         h(
           'div',
-          { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },
+          { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 } },
           h('strong', { style: { fontSize: 13, color: '#292923' } }, '任务依赖图'),
-          h('span', { style: { fontSize: 10, color: p.faint } }, picked.length ? `链 ${picked[0].chainId ?? picked[0].taskId} · ${picked.length} 件` : '还没有任务'),
+          h('span', { style: { fontSize: 10, color: p.faint } }, chains.length ? `${chains.length} 条链` : '还没有任务'),
           h('button', {
             type: 'button',
             onClick: onClose,
             style: { marginLeft: 'auto', border: 0, background: 'transparent', color: p.dim, cursor: 'pointer', fontSize: 14 },
           }, '×'),
+        ),
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' } },
+          chains.length > 1
+            ? h(
+                'select',
+                {
+                  value: activeChain,
+                  onChange: (event) => setSelectedChain(event.currentTarget.value),
+                  style: { fontSize: 10, padding: '3px 5px', border: '1px solid #E4DCC9', borderRadius: 5, background: '#FFFDF7', color: '#292923', maxWidth: 260 },
+                },
+                chains.map(({ chainId, list }) => h('option', { key: chainId, value: chainId }, `${chainId} · ${list.length} 件`)),
+              )
+            : null,
+          picked.length > 0
+            ? h('button', {
+                type: 'button',
+                disabled: ending,
+                onClick: async () => {
+                  setEnding(true)
+                  setEndNote('')
+                  try {
+                    const response = await fetch('/dsh-team/cancel', {
+                      method: 'POST',
+                      headers: { 'content-type': 'application/json' },
+                      body: JSON.stringify({ taskId: picked[0].taskId, chain: true }),
+                    })
+                    const data = await response.json()
+                    if (data.ok) {
+                      setEndNote(`已中止 ${Array.isArray(data.cancelled) ? data.cancelled.length : 0} 件`)
+                    } else {
+                      setEndNote(data.error ?? '中止失败')
+                    }
+                  } catch (error) {
+                    setEndNote(String(error?.message ?? error))
+                  } finally {
+                    setEnding(false)
+                  }
+                },
+                style: { fontSize: 10, padding: '3px 8px', border: '1px solid #D8B7A8', borderRadius: 5, background: '#FBEEE7', color: '#A14032', cursor: ending ? 'wait' : 'pointer' },
+              }, ending ? '中止中…' : '中止整链')
+            : null,
+          endNote ? h('span', { style: { fontSize: 10, color: '#A14032' } }, endNote) : null,
         ),
         picked.length === 0
           ? h('div', { style: { padding: '24px 8px', fontSize: 11, color: p.faint } }, '还没有可画的任务。先派一件活。')

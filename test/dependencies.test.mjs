@@ -500,6 +500,83 @@ test('team_resume：整链恢复，中断任务换号，下游依赖跟着改', 
   }
 })
 
+test('上游验收通过后，自动唤醒 blocked 的下游', async () => {
+  const { root, cleanup } = await fixture()
+  try {
+    const tools = fakeTools()
+    const subagents = stubSubagents()
+    const opts = options(tools, root, subagents)
+    registerTeamTools({}, opts)
+    opts.tasks.set('t-up', {
+      taskId: 't-up',
+      bot: 'a',
+      status: 'ready',
+      parentSession: 'session-test',
+      chainId: 't-up',
+      brief: { task: '先采集' },
+      review: false,
+    })
+    opts.tasks.set('t-down', {
+      taskId: 't-down',
+      bot: 'b',
+      status: 'blocked',
+      parentSession: 'session-test',
+      chainId: 't-up',
+      dependsOn: ['t-up'],
+      dependsOnMode: 'done',
+      blockedBy: '等依赖超时',
+      brief: { task: '再写作' },
+    })
+    const review = definitionOf(tools, 'team_review')
+    const result = JSON.parse(await run(review, { taskId: 't-up', verdict: 'accepted', grade: 'good' }))
+    assert.equal(result.ok, true)
+    for (let i = 0; i < 30; i += 1) {
+      if (opts.tasks.get('t-down')?.status === 'ready') break
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.equal(opts.tasks.get('t-down').status, 'ready')
+    assert.ok(subagents.calls.includes('b'), '下游没有被唤醒')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('重试 blocked 任务时，下游依赖改到新任务号', async () => {
+  const { root, cleanup } = await fixture()
+  try {
+    const tools = fakeTools()
+    const subagents = stubSubagents()
+    const opts = options(tools, root, subagents)
+    opts.agents.get = () => leadAgent
+    registerTeamTools({}, opts)
+    opts.tasks.set('t-old', {
+      taskId: 't-old',
+      bot: 'a',
+      status: 'blocked',
+      parentSession: 'session-test',
+      chainId: 't-old',
+      brief: { task: '先采集' },
+      blockedBy: '上游失败',
+    })
+    opts.tasks.set('t-next', {
+      taskId: 't-next',
+      bot: 'b',
+      status: 'blocked',
+      parentSession: 'session-test',
+      chainId: 't-old',
+      dependsOn: ['t-old'],
+      brief: { task: '再写作' },
+    })
+    const result = await opts.api.retry('t-old')
+    assert.ok(result.taskId && result.taskId !== 't-old', JSON.stringify(result))
+    const next = opts.tasks.get('t-next')
+    assert.deepEqual(next.dependsOn, [result.taskId])
+    assert.equal(opts.tasks.get('t-old').supersededBy, result.taskId)
+  } finally {
+    await cleanup()
+  }
+})
+
 test('team_dispatch：有交付物的活自动建审计任务，审计未过不能验收', async () => {
   const { root, cleanup } = await fixture()
   try {

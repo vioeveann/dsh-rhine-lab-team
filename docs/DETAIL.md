@@ -255,6 +255,22 @@ $DSH_TEAM_HOME/                       默认 $DSH_HOME/rhine-lab-team（`~/.dsh/
 
 新记录不再往账本里写字数：字数和成本没关系，原来靠它撑的每小时闸门也拆掉了（见上）。老账本里的 `chars` 留在原处不动，只给上面的 `≈` 折算用。
 
+## 出问题怎么查
+
+1. **先看面板顶部**：有红字就直接按红字做（没加载、另一个实例占用目录、自检失败）。没有红字再往下。
+2. **看任务详情**：状态、`note`、`blockedBy`、`dependsOn`、`reviewTaskId`、`cwd`、token 都在里面。`queued` 是还没抢到并发位或依赖没满足；`blocked` 看 `blockedBy`；`interrupted` 是进程重启时正在跑，点「恢复整链」。
+3. **看 `team_health`**：在跑几件、几件等你验收、最慢的一件是哪件。运行中的任务卡住时，插件会自己问、两次没回应会停掉再问。
+4. **看数据目录**：默认 `~/.dsh/rhine-lab-team`（`DSH_TEAM_HOME` 可覆盖）。`bots/` 是名册与人设，`.state/tasks.json` 是任务账本，`.state/settings.json` 是设置，`.team-work/` 是任务工作目录，`mailbox/messages.jsonl` 是成员信箱。
+5. **看日志**：`.debug/host.log` 按行记 JSON 事件；`continue-wait`、`wake-blocked`、`cancel`、`review` 这几个事件名能直接搜。开 Issue 时贴最后 50 行和 `package.json` 版本号。
+6. **开发自检**：`npm run check` 检查所有 JS 语法，`npm test` 跑 323 条；修完先跑这两个，再看面板。
+
+常见现象：
+
+- 子会话能派出去但产物写不进任务目录：看日志里的 `guard` 拒绝行；窄版只允许写任务目录，交付要 `team_collect`。
+- 下游一直 `queued`：上游没验收（`dependsOnMode: accepted`）或并发位满了；先验收上游，再看并发设置。
+- 依赖图空白：任务还没有 `chainId` 或还没开始跑；先派一件活。
+- 信箱显示失败：看 `/dsh-team/mailbox` 返回的 `error`；第一版只读，不回信。
+
 ## 还没做
 
 - ~~技术性失败自动重试~~：已做（超时 / 网络 / 网关类错误自动重试一次；用户取消与内容问题不重试）。
