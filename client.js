@@ -738,7 +738,7 @@ window.__ModuleLoader__.load({
 const MEMBERS_TAB_ID = 'dsh-team/members'
 
 /** 每次改客户端都改这个戳，用来判断页面拿到的是不是新 bundle。 */
-const BUILD_STAMP = 'a14'
+const BUILD_STAMP = 'a15'
 
 /**
  * 把「子会话 → Bot」的映射发布给 dsh-avatar-frame：
