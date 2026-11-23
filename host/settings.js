@@ -18,7 +18,7 @@ export const DEFAULT_SETTINGS = {
   /** 怎么称呼用户。默认「你」，不替用户决定被叫什么。 */
   address: '你',
   /** Tasks one session may run at the same time. */
-  maxConcurrent: 2,
+  maxConcurrent: 4,
   /** One task's hard timeout, in seconds. */
   taskTimeoutSec: 3600,
   /** 子会话多久没有新事件就提醒一次，单位秒。 */

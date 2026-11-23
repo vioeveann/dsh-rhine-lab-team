@@ -22,7 +22,7 @@ import { randomUUID } from 'node:crypto'
 import { watch } from 'node:fs'
 import { mkdir, readFile, appendFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 import { collectTask } from './deliver.js'
 import { buildTaskPrompt } from './brief.js'
@@ -842,9 +842,12 @@ export function startStallWatch(sessionId, options = {}) {
  * team writes. Missing files are simply skipped.
  * @param root - package directory.
  */
-export async function readTeamMemory(root) {
+export async function readTeamMemory(root, audience = 'all') {
   const parts = []
-  for (const name of ['knowledge.md', 'user.md', 'style.md']) {
+  const files = ['knowledge.md']
+  // 采集和审计不需要写作规范/用户偏好；只给共用事实，减少每次注入。
+  if (audience !== 'collector' && audience !== 'auditor') files.push('user.md', 'style.md')
+  for (const name of files) {
     try {
       const text = (await readFile(join(root, 'bots', '_team', name), 'utf8')).trim()
       if (text) parts.push(text)
@@ -853,6 +856,17 @@ export async function readTeamMemory(root) {
     }
   }
   return parts.join('\n\n')
+}
+
+/** 按角色裁剪团队知识：采集/审计只读事实，写作和秘书读全套。 */
+function memoryAudienceOf(bot) {
+  if (bot?.id === AUDITOR_ID) return 'auditor'
+  if (bot?.id === 'collector') return 'collector'
+  if (bot?.id === 'writer') return 'writer'
+  const role = String(bot?.role ?? '')
+  if (role.includes('资料')) return 'collector'
+  if (role.includes('写')) return 'writer'
+  return 'all'
 }
 
 async function readMemory(root, id, file) {
@@ -1200,8 +1214,15 @@ export function normalizeDependsOnMode(raw) {
  * @param limit - concurrency cap.
  * @returns `{ ok, active }`.
  */
-export function canStartTask(tasks, sessionId, limit) {
+export function canStartTask(tasks, sessionId, limit, options = {}) {
   const active = activeTaskCount(tasks, sessionId)
+  if (options.audit === true) {
+    const audits = [...(tasks?.values?.() ?? [])].filter(
+      (entry) => !entry.doneAt && entry.bot === AUDITOR_ID && entry.parentSession === sessionId,
+    ).length
+    // 审计单独占一个槽：同一父会话同时最多一件审计。
+    return { ok: audits < 1, active, audit: true }
+  }
   return { ok: active < limit, active }
 }
 
@@ -1238,6 +1259,27 @@ export function registerTeamTools(ctx, options) {
     if (args?.review === false) return false
     if (args?.review === true) return true
     return String(args?.deliverable ?? '').trim() !== ''
+  }
+
+  /**
+   * 纯内部小文件：只落在任务目录里的单个 .txt/.log/.json，且不超过 2KB。
+   * 这不是正式交付物，不触发自动审计；拿不准就照常审。
+   */
+  async function isSmallInternalDeliverable(entry) {
+    const raw = String(entry?.brief?.deliverable ?? '').trim()
+    if (raw === '' || /[\r\n;；]/.test(raw)) return false
+    const parts = raw.split(/[\s,，、]+/).filter(Boolean)
+    if (parts.length !== 1 || !entry?.cwd) return false
+    const file = isAbsolute(parts[0]) ? parts[0] : resolve(entry.cwd, parts[0])
+    const rel = relative(entry.cwd, file)
+    if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return false
+    if (!/\.(txt|log|json)$/i.test(file)) return false
+    try {
+      const info = await stat(file)
+      return info.isFile() && info.size <= 2048
+    } catch {
+      return false
+    }
   }
 
   /** 当前会话属于哪个 Bot：子会话的 sessionId 在账本里。 */
@@ -1293,23 +1335,54 @@ export function registerTeamTools(ctx, options) {
     }
     if (!auditor || auditor.status === 'disabled') return
     reviewQueued.add(entry.taskId)
+    if (await isSmallInternalDeliverable(entry)) {
+      entry.review = false
+      entry.reviewSkipped = 'small-internal'
+      void persistTasks?.()
+      void debug?.({ event: 'review-skip', taskId: entry.taskId, reason: 'small-internal' })
+      return
+    }
     const reviewTaskId = newTaskId()
     entry.reviewTaskId = reviewTaskId
     void persistTasks?.()
+    const previousId = String(entry.continuesFrom ?? '').trim()
+    const priorAudit = previousId === ''
+      ? null
+      : [...tasks.values()].find(
+        (row) => row.reviewOf === previousId && row.bot === AUDITOR_ID && ['ready', 'accepted'].includes(row.status),
+      )
+    const delta = previousId !== '' || String(entry.brief?.retryNote ?? '').trim() !== ''
     const excerpt = String(entry.output ?? entry.note ?? '').slice(0, 4000)
-    const prompt = [
-      `审计任务：只读复核 ${entry.taskId}（${entry.bot}）。`,
-      '',
-      `原任务：${entry.brief?.task ?? ''}`,
-      `交付物：${entry.brief?.deliverable ?? ''}`,
-      `验收标准：${entry.brief?.accept ?? ''}`,
-      '',
-      '原任务产出（节选）：',
-      excerpt === '' ? '（没有文字产出，去看 ./from-previous/ 里的文件）' : excerpt,
-      '',
-      '按固定清单检查：产物存在、数字可核、口径写清、引用有出处、没有不确定装确定。只挑问题，不改文件。',
-      '结论写清楚：通过，或不通过并逐条列必须改。',
-    ].join('\n')
+    const prompt = delta
+      ? [
+        `复审任务：只审 ${entry.taskId}${previousId === '' ? '' : ` 相对 ${previousId}`} 的改动，不重做全文审计。`,
+        '',
+        '上一轮审计意见：',
+        String(priorAudit?.output ?? '').slice(0, 3000) || '（找不到上一轮审计原文，按本次改动检查）',
+        '',
+        `原任务：${entry.brief?.task ?? ''}`,
+        `交付物：${entry.brief?.deliverable ?? ''}`,
+        `验收标准：${entry.brief?.accept ?? ''}`,
+        '',
+        '本次产出（节选）：',
+        excerpt === '' ? '（没有文字产出，去看 ./from-previous/ 里的文件）' : excerpt,
+        '',
+        '只检查三件事：上一轮列出的问题是否修到；改动是否引入新问题；交付物、数字、口径是否仍成立。',
+        '不要因为没重读全文就下结论；没看到的写不确定。只挑问题，不改文件。',
+      ].join('\n')
+      : [
+        `审计任务：只读复核 ${entry.taskId}（${entry.bot}）。`,
+        '',
+        `原任务：${entry.brief?.task ?? ''}`,
+        `交付物：${entry.brief?.deliverable ?? ''}`,
+        `验收标准：${entry.brief?.accept ?? ''}`,
+        '',
+        '原任务产出（节选）：',
+        excerpt === '' ? '（没有文字产出，去看 ./from-previous/ 里的文件）' : excerpt,
+        '',
+        '按固定清单检查：产物存在、数字可核、口径写清、引用有出处、没有不确定装确定。只挑问题，不改文件。',
+        '结论写清楚：通过，或不通过并逐条列必须改。',
+      ].join('\n')
     const reviewAbort = new AbortController()
     void dispatchTask({
       bot: AUDITOR_ID,
@@ -1708,7 +1781,7 @@ export function registerTeamTools(ctx, options) {
         }
       }
       const limit = maxConcurrent()
-      const gate = canStartTask(tasks, parentSessionForLimit, limit)
+      const gate = canStartTask(tasks, parentSessionForLimit, limit, { audit: bot.id === AUDITOR_ID })
       // 批量派活自己按并发上限分批，不再逐件过这个闸。
       if (!gate.ok && args?.__batch !== true) {
         return JSON.stringify({
@@ -4213,7 +4286,7 @@ export function installChildDecoration(ctx, options) {
     }
 
     try {
-      const team = await readTeamMemory(root)
+      const team = await readTeamMemory(root, memoryAudienceOf(hit.bot))
       const rawSoul = await readMemory(root, hit.bot.id, 'soul.txt')
       // 占位句只丢那一行：用户是在占位句下面接着写人设的，不能整份丢掉。
       const soul = stripSoulPlaceholder(rawSoul)
