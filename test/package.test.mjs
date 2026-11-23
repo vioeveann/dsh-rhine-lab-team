@@ -7,6 +7,17 @@ import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
+// 子会话沙箱里 Node 的 spawn 会被拒绝（EPERM）。这时跳过需要启动 npm 子进程的
+// 用例，保留其余静态检查；CI/本机没有这个限制，会照常跑完整包检查。
+const canSpawn = (() => {
+  try {
+    const probe = spawnSync(process.execPath, ['--version'], { encoding: 'utf8' })
+    return !probe.error
+  } catch {
+    return false
+  }
+})()
+
 test('发布元数据与 LICENSE 齐全', async () => {
   const root = join(here, '..')
   const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
@@ -28,7 +39,7 @@ test('npm 包不带个人 / 测试 Bot、记忆与内部开发史', async () => 
   assert.ok(files.includes('cordis.patch.yml'), 'bundle patch 必须进包')
 })
 
-test('npm pack 实际内容不含 bots / HANDOFF', () => {
+test('npm pack 实际内容不含 bots / HANDOFF', { skip: canSpawn ? false : '子会话沙箱不允许启动 npm 子进程' }, () => {
   const root = join(here, '..')
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
   const result = spawnSync(npm, ['pack', '--dry-run', '--json'], {
