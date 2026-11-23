@@ -3879,9 +3879,22 @@ export function installChildDecoration(ctx, options) {
       }
     }
 
+    // 任务目录在 DSH_HOME 下，不在默认工作区里；把这一条显式挂进该子会话的
+    // workspace-write 授权，否则 Bot 连自己的任务目录都写不进去。
+    let writableRootRegistered = false
+    try {
+      const sandboxPolicy = agent?.ctx?.sandboxPolicy ?? ctx?.sandboxPolicy ?? ctx?.get?.('sandboxPolicy')
+      if (hit?.taskDir && typeof sandboxPolicy?.registerWritableRoot === 'function') {
+        sandboxPolicy.registerWritableRoot(agent.session, hit.taskDir)
+        writableRootRegistered = true
+      }
+    } catch (error) {
+      await debug?.({ event: 'sandbox-root', ok: false, error: String(error?.message ?? error) })
+    }
+
     try {
       agent.session.append('sandbox/mode', { mode: 'workspace-write', source: 'delegation' })
-      await debug?.({ event: 'sandbox', ok: true })
+      await debug?.({ event: 'sandbox', ok: true, writableRoot: writableRootRegistered })
     } catch (error) {
       await debug?.({ event: 'sandbox', ok: false, error: String(error?.message ?? error) })
     }
