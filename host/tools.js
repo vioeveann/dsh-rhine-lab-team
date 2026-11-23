@@ -2754,7 +2754,16 @@ export function registerTeamTools(ctx, options) {
         await debug?.({ event: 'chat-open', bot: bot.id, sessionId: childId })
         // 父会话 id 一起回去：面板拿到就能直接开出「子会话」标签，
         // 不用等名册刷新（等那一下，用户第一次点必然失败）。
-        return { ok: true, sessionId: childId, parentSessionId: parent, bot: bot.id }
+        // identity 也一起回去：面板拿它先写进头像映射，第一帧就不会顶着主会话的头像。
+        // 字段跟 `/dsh-team/identity-map` 那份保持一致，改的时候两边一起改。
+        const identity = {
+          id: bot.id,
+          name: bot.name ?? bot.id,
+          src: `/dsh-team/avatar?bot=${encodeURIComponent(bot.id)}&v=3`,
+          onOpen: true,
+          speech: false,
+        }
+        return { ok: true, sessionId: childId, parentSessionId: parent, identity, bot: bot.id }
       } catch (error) {
         pending.delete(childId)
         return { ok: false, error: String(error?.message ?? error) }

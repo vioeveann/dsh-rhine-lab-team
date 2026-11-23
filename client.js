@@ -782,6 +782,30 @@ async function publishTeamIdentity(force = false) {
   }
 }
 
+/**
+ * 立刻把一条「子会话 → Bot 身份」写进映射，不等 10 秒轮询。
+ *
+ * 头像插件在会话标签挂上去的那一刻就会读这份映射；等下一轮轮询，前几秒
+ * 子会话会顶着主会话的头像和 ID。开页之前先写，第一帧就是对的。
+ *
+ * @param sessionId - 子会话号。
+ * @param identity - 宿主给的整条身份记录（id / name / src / onOpen / speech）。
+ */
+function stampTeamIdentity(sessionId, identity) {
+  if (!sessionId || !identity || typeof identity !== 'object') return
+  try {
+    const raw = localStorage.getItem(TEAM_IDENTITY_KEY)
+    const map = raw ? JSON.parse(raw) : {}
+    map[String(sessionId)] = identity
+    const next = JSON.stringify(map)
+    lastIdentityRaw = next
+    localStorage.setItem(TEAM_IDENTITY_KEY, next)
+    window.dispatchEvent(new CustomEvent(TEAM_IDENTITY_EVENT))
+  } catch {
+    // 写不进去就靠 10 秒轮询兜底
+  }
+}
+
 /** tab 类型判别值；`ctx.sidebarRight.openTab` 用它开页。 */
 const MEMBERS_TAB_KIND = 'dsh-team-members'
 
@@ -5084,6 +5108,8 @@ function createMembersPanel(React, host) {
       let sessionId = member?.sessionId
       // 刚开出来的会话，名册还没刷新，父会话 id 只能从开会话的返回值里拿。
       let openedParent = ''
+      // 宿主连身份一起给：开页前写进头像映射，第一帧就是 Bot 自己。
+      let openedIdentity
       if (!sessionId) {
         // 还没有会话：先开一个单聊会话，再把它打开。
         setNoSessionHint(member?.id ?? null)
@@ -5102,6 +5128,7 @@ function createMembersPanel(React, host) {
           }
           sessionId = data.sessionId
           openedParent = String(data.parentSessionId ?? '')
+          openedIdentity = data.identity
           setNotice('')
         } catch (error) {
           setNotice(`开会话失败：${error?.message ?? error}`)
@@ -5145,6 +5172,10 @@ function createMembersPanel(React, host) {
         reportDiag({ event: 'split-failed', error: String(error?.message ?? error) })
       }
 
+      // 头像/ID 的第一帧：开页之前先把这一条映射写进去，别让它先顶着主会话的脸。
+      // 映射平时靠 10 秒轮询刷新，等那一轮就是好几秒的错头像。
+      stampTeamIdentity(sessionId, openedIdentity)
+
       // 子会话刚建好时，客户端的会话表还没跟上，openResource 会以
       // 「invalid chat resource address」拒一次（父会话 id 为空也会这样）。
       // 给它几次机会，别让用户点第二次。
@@ -5168,6 +5199,8 @@ function createMembersPanel(React, host) {
         return
       }
       setNotice('')
+      // 开页之后跟宿主对一次全量映射：新会话、头像版本、名字都会补齐。
+      void publishTeamIdentity(true)
 
       // 有时候侧栏没真的把会话开出来（分栏满了、或者资源被引导页顶掉）：
       // 等一下检查，不行就退回主视图打开。
