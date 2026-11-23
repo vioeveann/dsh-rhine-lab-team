@@ -2072,6 +2072,8 @@ function createMembersPanel(React, host) {
     const [bots, setBots] = React.useState([])
     const [groupNote, setGroupNote] = React.useState('')
     const [newGroup, setNewGroup] = React.useState('')
+    /** 这个面板里刚建好的组：建完之后导出/导入就不用再等重开面板。 */
+    const [createdGroup, setCreatedGroup] = React.useState(null)
     /** 保存团队记忆这类操作的进度/结果。 */
     const [status, setStatus] = React.useState('')
     const [teamSettings, setTeamSettings] = React.useState(null)
@@ -2189,6 +2191,9 @@ function createMembersPanel(React, host) {
       }
     }, [])
 
+    /** 有没有「当前组」：从组卡片展开时是有的；新建面板要等这一屏里建成组之后。 */
+    const hasGroup = Boolean(group || createdGroup)
+
     const button = (label, onClick, tone) => h(
       'button',
       {
@@ -2294,6 +2299,7 @@ function createMembersPanel(React, host) {
                     return
                   }
                   setNewGroup('')
+                  setCreatedGroup(data.group ?? true)
                   setGroupNote(`已创建：${data.group?.name ?? ''}`)
                 } catch (error) {
                   setGroupNote(`创建失败：${error?.message ?? error}`)
@@ -2320,6 +2326,11 @@ function createMembersPanel(React, host) {
               h('button', {
                 type: 'button',
                 onClick: async () => {
+                  // 组还没建起来时没有「当前组」，导出/导入都先拦一下。
+                  if (!hasGroup) {
+                    setStatus('请先创建组，再导出成员')
+                    return
+                  }
                   setStatus('导出中…')
                   try {
                     const response = await fetch('/dsh-team/export-pack', { method: 'POST' })
@@ -2339,6 +2350,13 @@ function createMembersPanel(React, host) {
               h('div', { style: { fontSize: 10, color: p.faint } }, '导入成员（导入到当前组）'),
               // 用 label 包住隐藏的目录选择框：点文字就弹系统选择框，不用输入路径。
               h('label', {
+                // 组还没建起来时没有「当前组」可导入：拦下选择框，先提示。
+                onClick: (event) => {
+                  if (!hasGroup) {
+                    event.preventDefault()
+                    setStatus('请先创建组，再导入成员')
+                  }
+                },
                 style: {
                   display: 'inline-flex',
                   alignItems: 'center',
@@ -2400,13 +2418,12 @@ function createMembersPanel(React, host) {
               { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
               [
                 // 并发 = 同一个会话里能同时跑几个子智能体（Bot）。
-                ['address', '称谓（提示词里怎么称呼你）', 90],
-                ['maxConcurrent', '并发（同时跑的子智能体数）', 150],
-                ['taskTimeoutSec', '超时(秒)', 3600],
-                ['stallWarnSec', '第一次问(秒)', 180],
-                ['stallHardSec', '再问间隔(秒)', 300],
-                ['stallGraceSec', '等回答宽限(秒)', 300],
-              ].map(([key, label, width]) => h(
+                ['address', '称谓（提示词里怎么称呼你）', 90, 'text'],
+                ['maxConcurrent', '并发（同时跑的子智能体数）', 150, 'number'],
+                // 一件活最多跑多久：从派出去开始算，到时间还没交回来就判超时、释放父会话。
+                // 3600 = 1 小时，按需要自己调。
+                ['taskTimeoutSec', '单任务最长运行（秒，3600 = 1 小时）', 170, 'number'],
+              ].map(([key, label, width, type]) => h(
                 'label',
                 {
                   key,
@@ -2414,7 +2431,7 @@ function createMembersPanel(React, host) {
                 },
                 label,
                 h('input', {
-                  type: 'number',
+                  type,
                   value: teamSettings[key],
                   onChange: (event) => setTeamSettings({ ...teamSettings, [key]: event.target.value }),
                   style: {
@@ -2432,7 +2449,7 @@ function createMembersPanel(React, host) {
             h(
               'label',
               { style: { display: 'flex', flexDirection: 'column', gap: 2, fontSize: 10, color: p.dim } },
-              '交付目录（留空 = 插件目录下 deliverables，可填绝对路径）',
+              '交付目录（留空 = 文档目录下 dsh-team-deliverables，可填绝对路径）',
               h('input', {
                 value: teamSettings.deliverableRoot ?? '',
                 onChange: (event) => setTeamSettings({ ...teamSettings, deliverableRoot: event.target.value }),
