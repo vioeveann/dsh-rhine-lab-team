@@ -2752,7 +2752,9 @@ export function registerTeamTools(ctx, options) {
         void persistTasks?.()
         options.api?.broadcast?.({ type: 'tasks' })
         await debug?.({ event: 'chat-open', bot: bot.id, sessionId: childId })
-        return { ok: true, sessionId: childId, bot: bot.id }
+        // 父会话 id 一起回去：面板拿到就能直接开出「子会话」标签，
+        // 不用等名册刷新（等那一下，用户第一次点必然失败）。
+        return { ok: true, sessionId: childId, parentSessionId: parent, bot: bot.id }
       } catch (error) {
         pending.delete(childId)
         return { ok: false, error: String(error?.message ?? error) }

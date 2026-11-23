@@ -5082,6 +5082,8 @@ function createMembersPanel(React, host) {
 
     const openChat = async (member) => {
       let sessionId = member?.sessionId
+      // 刚开出来的会话，名册还没刷新，父会话 id 只能从开会话的返回值里拿。
+      let openedParent = ''
       if (!sessionId) {
         // 还没有会话：先开一个单聊会话，再把它打开。
         setNoSessionHint(member?.id ?? null)
@@ -5099,6 +5101,7 @@ function createMembersPanel(React, host) {
             return
           }
           sessionId = data.sessionId
+          openedParent = String(data.parentSessionId ?? '')
           setNotice('')
         } catch (error) {
           setNotice(`开会话失败：${error?.message ?? error}`)
@@ -5129,7 +5132,7 @@ function createMembersPanel(React, host) {
         return
       }
 
-      const parent = member?.parentSessionId
+      const parent = member?.parentSessionId ?? openedParent
       const address = `dsh-resource://subagentchat/session/${encodeURIComponent(sessionId)}`
         + `?parent=${encodeURIComponent(parent ?? '')}&mode=unknown`
 
@@ -5142,18 +5145,29 @@ function createMembersPanel(React, host) {
         reportDiag({ event: 'split-failed', error: String(error?.message ?? error) })
       }
 
-      try {
-        sidebar.openResource(
-          address,
-          paneId === undefined
-            ? { kind: 'subagentchat', preferNewPane: true }
-            : { kind: 'subagentchat', paneId },
-        )
-        setNotice('')
-      } catch (error) {
-        setNotice(`打开会话失败：${error?.message ?? error}`)
+      // 子会话刚建好时，客户端的会话表还没跟上，openResource 会以
+      // 「invalid chat resource address」拒一次（父会话 id 为空也会这样）。
+      // 给它几次机会，别让用户点第二次。
+      const target = paneId === undefined
+        ? { kind: 'subagentchat', preferNewPane: true }
+        : { kind: 'subagentchat', paneId }
+      let openError
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        try {
+          sidebar.openResource(address, target)
+          openError = undefined
+          break
+        } catch (error) {
+          openError = error
+          reportDiag({ event: 'open-retry', attempt, error: String(error?.message ?? error) })
+          await new Promise((resolve) => { setTimeout(resolve, 200 + attempt * 150) })
+        }
+      }
+      if (openError) {
+        setNotice(`打开会话失败：${openError?.message ?? openError}`)
         return
       }
+      setNotice('')
 
       // 有时候侧栏没真的把会话开出来（分栏满了、或者资源被引导页顶掉）：
       // 等一下检查，不行就退回主视图打开。
