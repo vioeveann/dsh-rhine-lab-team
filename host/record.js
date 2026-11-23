@@ -107,6 +107,10 @@ export function buildTaskRecord(entry, options = {}) {
   }
   const blockedBy = String(entry?.blockedBy ?? '').trim()
   if (blockedBy !== '') lines.push(`- 阻塞：${blockedBy}`)
+  if (entry?.review === true) {
+    const audit = entry.reviewTaskId ? `（审计任务 ${entry.reviewTaskId}）` : ''
+    lines.push(`- 审查：需要审计通过后才能验收${audit}`)
+  }
 
   const brief = entry?.brief ?? {}
   const task = String(brief.task ?? '').trim()

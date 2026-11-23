@@ -178,6 +178,17 @@ function openInEditor(file) {
  * @param now - current epoch ms.
  * @param thresholdMs - how long counts as stuck.
  */
+/** 这件活当前卡在审查链哪一步。 */
+export function reviewStateOf(entry, audit) {
+  if (!entry?.review) return ''
+  if (entry.status === 'accepted') return 'passed'
+  if (!audit) return entry.reviewTaskId ? 'queued' : 'pending'
+  if (audit.status === 'accepted' || audit.verdict === 'accepted') return 'passed'
+  if (audit.verdict === 'rejected' || ['rejected', 'failed', 'blocked', 'cancelled', 'timeout'].includes(audit.status)) return 'failed'
+  if (audit.status === 'ready') return 'review'
+  return 'auditing'
+}
+
 export function isStuck(entry, now = Date.now(), thresholdMs = 10 * 60_000) {
   if (!entry || entry.doneAt) return false
   const startedAt = Number(entry.startedAt ?? 0)
@@ -365,7 +376,10 @@ export function installTeamMode(ctx, options) {
         const url = new URL(req.url ?? '/', 'http://localhost')
         const raw = url.searchParams.get('sessionId') ?? ''
         const sessionId = raw === 'unknown' ? '' : raw
-        const rows = [...tasks.values()]
+        const all = [...tasks.values()]
+        const audits = new Map()
+        for (const row of all) if (row.reviewOf) audits.set(row.reviewOf, row)
+        const rows = all
           .filter((entry) => sessionId === '' || entry.parentSession === sessionId)
           .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))
           .slice(0, 20)
@@ -389,6 +403,10 @@ export function installTeamMode(ctx, options) {
             dependsOnMode: entry.dependsOnMode ?? 'done',
             chainId: entry.chainId ?? entry.taskId ?? '',
             blockedBy: entry.blockedBy ?? '',
+            review: entry.review === true,
+            reviewOf: entry.reviewOf ?? '',
+            reviewTaskId: entry.reviewTaskId ?? '',
+            reviewState: reviewStateOf(entry, audits.get(entry.taskId)),
           }))
         json(res, 200, { tasks: rows })
       } catch (error) {
@@ -427,6 +445,10 @@ export function installTeamMode(ctx, options) {
             dependsOnMode: entry.dependsOnMode ?? 'done',
             chainId: entry.chainId ?? entry.taskId ?? '',
             blockedBy: entry.blockedBy ?? '',
+            review: entry.review === true,
+            reviewOf: entry.reviewOf ?? '',
+            reviewTaskId: entry.reviewTaskId ?? '',
+            reviewState: reviewStateOf(entry, [...tasks.values()].find((row) => row.reviewOf === entry.taskId)),
             startedAt: entry.startedAt ?? null,
             doneAt: entry.doneAt ?? null,
           },

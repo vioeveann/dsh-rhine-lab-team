@@ -1205,6 +1205,14 @@ export function registerTeamTools(ctx, options) {
   /** 任务号：并行派活时同一毫秒可能起两件，随机尾必须带。 */
   const newTaskId = () => `t-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
 
+  // 有交付物的活默认要过审计；秘书可以显式 review:false 跳过，审计员自己不审自己。
+  function wantsReview(bot, args) {
+    if (bot?.id === AUDITOR_ID) return false
+    if (args?.review === false) return false
+    if (args?.review === true) return true
+    return String(args?.deliverable ?? '').trim() !== ''
+  }
+
   /** 当前会话属于哪个 Bot：子会话的 sessionId 在账本里。 */
   function botOfSession(sessionId) {
     if (!sessionId) return ''
@@ -1241,6 +1249,56 @@ export function registerTeamTools(ctx, options) {
     const bot = bots.find((item) => item.id === id)
     if (!bot || bot.status === 'disabled') return null
     return bot
+  }
+
+  const reviewQueued = new Set()
+
+  // 有交付物的任务完成后，自动给它建一张审计子任务；终审仍由秘书做。
+  async function maybeQueueReview(entry, exec) {
+    if (!entry?.review || entry.bot === AUDITOR_ID) return
+    if (reviewQueued.has(entry.taskId)) return
+    if ([...tasks.values()].some((row) => row.reviewOf === entry.taskId)) return
+    let auditor
+    try {
+      auditor = await readBot(root, AUDITOR_ID)
+    } catch {
+      auditor = null
+    }
+    if (!auditor || auditor.status === 'disabled') return
+    reviewQueued.add(entry.taskId)
+    const reviewTaskId = newTaskId()
+    entry.reviewTaskId = reviewTaskId
+    void persistTasks?.()
+    const excerpt = String(entry.output ?? entry.note ?? '').slice(0, 4000)
+    const prompt = [
+      `审计任务：只读复核 ${entry.taskId}（${entry.bot}）。`,
+      '',
+      `原任务：${entry.brief?.task ?? ''}`,
+      `交付物：${entry.brief?.deliverable ?? ''}`,
+      `验收标准：${entry.brief?.accept ?? ''}`,
+      '',
+      '原任务产出（节选）：',
+      excerpt === '' ? '（没有文字产出，去看 ./from-previous/ 里的文件）' : excerpt,
+      '',
+      '按固定清单检查：产物存在、数字可核、口径写清、引用有出处、没有不确定装确定。只挑问题，不改文件。',
+      '结论写清楚：通过，或不通过并逐条列必须改。',
+    ].join('\n')
+    void dispatchTask({
+      bot: AUDITOR_ID,
+      task: prompt,
+      fromTask: entry.taskId,
+      review: false,
+      __taskId: reviewTaskId,
+      __reviewOf: entry.taskId,
+      __batch: true,
+      dependsOn: [entry.taskId],
+      dependsOnMode: 'done',
+      chainId: entry.chainId ?? entry.taskId,
+    }, { ...exec, signal: undefined }).catch((error) => {
+      entry.reviewTaskId = ''
+      void persistTasks?.()
+      void debug?.({ event: 'review-queue', ok: false, taskId: entry.taskId, error: String(error?.message ?? error) })
+    })
   }
 
   /**
@@ -1389,6 +1447,8 @@ export function registerTeamTools(ctx, options) {
       dependsOn,
       dependsOnMode: 'accepted',
       chainId,
+      review: wantsReview(bot, args),
+      reviewOf: String(args?.__reviewOf ?? '').trim() || null,
       model: typeof bot.model === 'string' ? bot.model : '',
       brief,
     })
@@ -1579,6 +1639,8 @@ export function registerTeamTools(ctx, options) {
           dependsOn,
           dependsOnMode,
           chainId,
+          review: wantsReview(bot, args),
+          reviewOf: String(args?.__reviewOf ?? '').trim() || null,
           model: typeof bot.model === 'string' ? bot.model : '',
           brief: queuedBrief,
         })
@@ -1665,6 +1727,8 @@ export function registerTeamTools(ctx, options) {
         dependsOn,
         dependsOnMode,
         chainId,
+        review: wantsReview(bot, args),
+        reviewOf: String(args?.__reviewOf ?? '').trim() || null,
         // 面板要能看出这次实际用的是哪个模型（空 = 跟随默认）。
         model: typeof bot.model === 'string' ? bot.model : '',
         brief: {
@@ -2008,6 +2072,7 @@ export function registerTeamTools(ctx, options) {
         if (entry && finalText !== '') entry.output = finalText.slice(0, 4000)
         void persistTasks?.()
         // 干完就推一张实时卡片：不等秘书收尾再贴。
+        if (entry?.status === 'ready') void maybeQueueReview(entry, exec)
         if (entry) {
           options.api?.broadcast?.({
             type: 'task-done',
@@ -2065,6 +2130,7 @@ export function registerTeamTools(ctx, options) {
       status: 'running',
       sessionId,
       model: entry.model ?? '',
+      review: entry.review === true,
       continuesFrom: entry.taskId,
       brief,
     })
@@ -2135,6 +2201,7 @@ export function registerTeamTools(ctx, options) {
     }
     void persistTasks?.()
     options.api?.broadcast?.({ type: 'tasks' })
+    if (row?.status === 'ready') void maybeQueueReview(row, exec)
     if (row) {
       options.api?.broadcast?.({
         type: 'task-done',
@@ -2650,6 +2717,7 @@ export function registerTeamTools(ctx, options) {
       dependsOn: { type: 'string', description: '依赖：JSON 数组或逗号分隔的任务号。上游默认跑完（ready）就放行；写 dependsOnMode=accepted 则必须验收通过。上游失败/打回就直接判 blocked，不 spawn。' },
       dependsOnMode: { type: 'string', description: 'done（默认，上游跑完就放行）或 accepted（上游验收通过才放行）。' },
       dependsOnTimeoutSec: { type: 'number', description: '等依赖的最长秒数，默认 1800；超时则 blocked。' },
+      review: { type: 'boolean', description: '是否强制审计：默认有 deliverable 就 true；显式 false 可跳过。审计员的活不审。' },
     },
     output: {
       schema: { type: 'string' },
@@ -3075,6 +3143,25 @@ export function registerTeamTools(ctx, options) {
         if (verdict !== 'accepted' && verdict !== 'rejected') {
           return JSON.stringify({ ok: false, error: 'verdict 只能是 accepted 或 rejected' })
         }
+        // 有交付物的活必须先过审计：这是流程，不靠秘书自觉。
+        if (verdict === 'accepted' && entry.review === true && entry.bot !== AUDITOR_ID) {
+          const auditorThere = (await loadBots(root)).some((bot) => bot.id === AUDITOR_ID && bot.status !== 'disabled')
+          if (auditorThere) {
+            const audits = [...tasks.values()].filter((row) => row.reviewOf === entry.taskId)
+            const passed = audits.find((row) => row.status === 'accepted' || row.verdict === 'accepted')
+            if (!passed) {
+              const pending = audits.find((row) => ['queued', 'running', 'ready'].includes(row.status))
+              return JSON.stringify({
+                ok: false,
+                error: pending
+                  ? `这件活需要先审计：审计任务 ${pending.taskId} 还没验收通过（${pending.status}）。先审它，再回来验这件。`
+                  : `这件活需要先审计：审计任务还没建好或已被打回。等审计员接单，或让审计员重审后再验收。`,
+                code: 'review-required',
+              })
+            }
+            entry.auditTaskId = passed.taskId
+          }
+        }
         if (verdict === 'rejected' && note === '') {
           return JSON.stringify({ ok: false, error: '打回必须写清哪一条不过' })
         }
@@ -3089,9 +3176,9 @@ export function registerTeamTools(ctx, options) {
         // excellent 是唯一会把好评率抬起来的一档：必须有审计记录才准给。
         // 审计员不在了（用户删了）就放行——那时候没有第二双眼睛，只能靠我自己核。
         if (verdict === 'accepted' && gradeInput === 'excellent') {
-          const auditorThere = (await loadBots(root)).some((bot) => bot.id === AUDITOR_ID)
+          const auditorThere = (await loadBots(root)).some((bot) => bot.id === AUDITOR_ID && bot.status !== 'disabled')
           if (auditorThere) {
-            const auditTaskId = String(args?.auditTaskId ?? '').trim()
+            const auditTaskId = String(args?.auditTaskId ?? entry.auditTaskId ?? '').trim()
             if (auditTaskId === '') {
               return JSON.stringify({
                 ok: false,

@@ -6105,6 +6105,7 @@ function createMembersPanel(React, host) {
           detail.brief?.task ? h('div', null, `任务单：${detail.brief.task}`) : null,
           detail.dependsOn?.length ? h('div', null, `依赖${detail.dependsOnMode === 'accepted' ? '（验收后放行）' : ''}：${detail.dependsOn.join('、')}`) : null,
           detail.blockedBy ? h('div', { style: { color: p.warn } }, `阻塞：${detail.blockedBy}`) : null,
+          detail.review ? h('div', { style: { color: detail.reviewState === 'failed' ? p.danger : p.dim } }, `审查：${detail.reviewState === 'passed' ? '审计通过' : detail.reviewState === 'failed' ? '审计未过' : detail.reviewState === 'review' ? '审计已交，待秘书验收' : detail.reviewState === 'pending' ? '待审计' : '审计中'}${detail.reviewTaskId ? `（${detail.reviewTaskId}）` : ''}`) : null,
           h(TaskMailThread, { taskId: detail.taskId, p }),
           detail.brief?.accept ? h('div', null, `验收：${detail.brief.accept}`) : null,
           detail.brief?.redlines ? h('div', null, `红线：${detail.brief.redlines}`) : null,
@@ -6322,6 +6323,21 @@ function createMembersPanel(React, host) {
                   h('span', { style: { color: p.dim } }, `@${task.bot}`),
                   botRole ? h('span', { style: { color: p.faint } }, botRole) : null,
                   task.continuesFrom ? h('span', { style: { color: p.accentSoft }, title: `原会话继续：${task.continuesFrom}` }, '续') : null,
+                  task.review && task.reviewState
+                    ? h('span', {
+                        style: {
+                          color: task.reviewState === 'passed' ? p.good
+                            : task.reviewState === 'failed' ? p.danger
+                            : task.reviewState === 'review' ? p.accent
+                            : p.warn,
+                        },
+                        title: task.reviewTaskId ? `审计任务：${task.reviewTaskId}` : '有交付物，默认要过审计',
+                      }, task.reviewState === 'passed' ? '审计通过'
+                        : task.reviewState === 'failed' ? '审计未过'
+                        : task.reviewState === 'review' ? '待验审计'
+                        : task.reviewState === 'queued' ? '审计排队'
+                        : task.reviewState === 'pending' ? '待审计' : '审计中')
+                    : null,
                   task.dependsOn?.length
                     ? h('span', {
                         style: { color: task.status === 'blocked' ? p.danger : p.faint },

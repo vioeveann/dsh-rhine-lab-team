@@ -455,3 +455,30 @@ test('取消排队的验收门任务后，上游验收也不会把它偷偷启�
     await cleanup()
   }
 })
+
+test('team_dispatch：有交付物的活自动建审计任务，审计未过不能验收', async () => {
+  const { root, cleanup } = await fixture()
+  try {
+    const tools = fakeTools()
+    const subagents = stubSubagents()
+    const opts = options(tools, root, subagents)
+    registerTeamTools({}, opts)
+    const dispatch = definitionOf(tools, 'team_dispatch')
+    const raw = JSON.parse(await run(dispatch, { bot: 'a', task: '写报告', deliverable: 'report.md' }))
+    assert.equal(raw.status, 'ready')
+    let audit = null
+    for (let i = 0; i < 40; i += 1) {
+      audit = [...opts.tasks.values()].find((row) => row.reviewOf === raw.taskId) ?? null
+      if (audit) break
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.ok(audit, '没有自动生成审计任务')
+    assert.equal(audit.bot, 'auditor')
+    const review = definitionOf(tools, 'team_review')
+    const blocked = JSON.parse(await run(review, { taskId: raw.taskId, verdict: 'accepted', grade: 'good' }))
+    assert.equal(blocked.ok, false)
+    assert.match(blocked.error, /需要先审计/)
+  } finally {
+    await cleanup()
+  }
+})
