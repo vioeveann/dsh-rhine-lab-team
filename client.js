@@ -6151,7 +6151,7 @@ function createMembersPanel(React, host) {
           h(TaskMailThread, { taskId: detail.taskId, p }),
           detail.brief?.accept ? h('div', null, `验收：${detail.brief.accept}`) : null,
           detail.brief?.redlines ? h('div', null, `红线：${detail.brief.redlines}`) : null,
-          detail.cwd ? h('div', { style: { wordBreak: 'break-all' } }, `目录：${detail.cwd}`) : null,
+          detail.cwd ? h('div', { style: { wordBreak: 'break-all' } }, `工作区：${detail.cwd}${detail.bot === 'auditor' ? '（只读）' : '（任务目录可写）'}`) : null,
           detail.tokens?.total
             ? h(
                 'div',

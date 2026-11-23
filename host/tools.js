@@ -4080,8 +4080,9 @@ export function installChildDecoration(ctx, options) {
     }
 
     try {
-      agent.session.append('sandbox/mode', { mode: 'workspace-write', source: 'delegation' })
-      await debug?.({ event: 'sandbox', ok: true, writableRoot: writableRootRegistered })
+      const mode = hit?.bot === AUDITOR_ID ? 'read-only' : 'workspace-write'
+      agent.session.append('sandbox/mode', { mode, source: 'delegation' })
+      await debug?.({ event: 'sandbox', ok: true, mode, writableRoot: writableRootRegistered })
     } catch (error) {
       await debug?.({ event: 'sandbox', ok: false, error: String(error?.message ?? error) })
     }

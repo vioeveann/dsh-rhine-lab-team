@@ -14,6 +14,7 @@ import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { installChildDecoration, readTeamMemory, registerMemoryTools, registerTeamTools, SECRETARY_RULES } from './tools.js'
+import { createWorkspaceGuard } from './guard.js'
 import { adoptSoulFile, loadBots, migratePersona } from './bots.js'
 import { ensureBuiltinBots } from './builtin-bots.js'
 import { installTeamMode, readRoster } from './team-mode.js'
@@ -354,6 +355,8 @@ export async function apply(ctx, config = {}) {
       isTeamSession: (sessionId) => Boolean(teamMode?.isEnabled?.(sessionId)),
     })
     ctx.effect(() => disposeTools)
+    const disposeGuard = tools.guard(createWorkspaceGuard({ tasks, deliverableRoot: DELIVERABLES }))
+    ctx.effect(() => disposeGuard)
     const disposeMemory = registerMemoryTools(ctx, { root: ROOT, tools, debug, pending })
     ctx.effect(() => disposeMemory)
     await debug({ event: 'tools', name: 'team_dispatch+team_recall', ok: true })

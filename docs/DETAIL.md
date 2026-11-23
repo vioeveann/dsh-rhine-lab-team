@@ -88,6 +88,12 @@ node --check host/*.js
 
 有交付物的任务默认 `review: true`：任务交回 `ready` 后，插件自动建一张同链的审计任务，`reviewOf` 指向原任务，`dependsOn` 原任务，交给 `auditor` 只读复核。原任务在审计任务被验收（`accepted`）之前，`team_review` 会返回 `review-required`，秘书不能直接打分。审计打回则原任务先返工，不带病验收。审计员自己的任务不再套一层；派活时显式 `review: false` 可以跳过。终审仍由秘书做，审计员只给问题清单。
 
+## 工作区与权限（窄版）
+
+每个任务有自己的目录 `$DSH_HOME/rhine-lab-team/.team-work/<bot>/<taskId>`，子会话的 `cwd` 就落在这里。文件类写入工具（`write` / `edit` / `ops_write` 等）只允许写这个目录；直接写交付目录会被拒绝，交付统一走 `team_collect`。审计任务在沙箱层就是 `read-only`，插件再挡一层文件写入。
+
+边界要说清楚：DSH 的委派子会话会继承父会话的沙箱根，所以 shell / `run_code` 仍受**整个工作区**的 `workspace-write` 约束，不随任务目录缩小。窄版只能保证「文件工具不乱写」和「审计只读」，不是完整的内核级隔离。
+
 ## 成员信箱
 
 成员之间可以直接发信，不再所有对齐都经秘书转。消息存在 `$DSH_HOME/rhine-lab-team/mailbox/messages.jsonl`，带 `from/to/subject/body/threadId/taskId/read`；`team_send` 发、`team_inbox` 读、`team_reply` 沿线程回。收件人必须是团队里已启用的 Bot；秘书可发，不能作为收件人；每人每小时最多 20 条。
