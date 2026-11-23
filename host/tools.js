@@ -1102,6 +1102,8 @@ export function activeTaskCount(tasks, sessionId) {
     if (entry.doneAt) continue
     // 排队等依赖的任务不占并发名额：它还没起子会话。
     if (entry.status === 'queued') continue
+    // 重启时中断的任务没有句柄，恢复前也不占名额。
+    if (entry.status === 'interrupted') continue
     if (entry.parentSession !== sessionId) continue
     count += 1
   }
@@ -1140,6 +1142,19 @@ export function normalizeDependsOn(raw) {
 }
 
 /**
+ * 重启恢复时，把旧任务号映射到新任务号；映射为空的依赖说明上游没恢复，保留原值让下游受阻。
+ * @param ids - 原依赖任务号。
+ * @param mapping - old -> new（new 为空表示失败）。
+ * @returns 新依赖数组。
+ */
+export function remapDependsOn(ids, mapping) {
+  return (ids ?? []).map((id) => {
+    const next = mapping instanceof Map ? mapping.get(id) : mapping?.[id]
+    return String(next || id)
+  })
+}
+
+/**
  * 一个依赖任务当前算什么状态。
  * ready 只是「跑完了、等验收」，下游可以先做；rejected/failed 等才算坏。
  * @param entry - 依赖的账本行。
@@ -1152,7 +1167,7 @@ export function dependencyState(entry, mode = 'done') {
   // accepted 模式：跑完还不算数，必须验收通过；验收前下游不能动。
   if (mode === 'accepted' && status === 'ready') return 'pending'
   if (status === 'ready') return 'ok'
-  if (['rejected', 'failed', 'timeout', 'blocked', 'cancelled', 'needs-decision'].includes(status)) return 'bad'
+  if (['rejected', 'failed', 'timeout', 'blocked', 'cancelled', 'needs-decision', 'interrupted'].includes(status)) return 'bad'
   // queued 只是在排队，还没有结论；和 running 一样先等。
   return 'pending'
 }
@@ -2611,52 +2626,164 @@ export function registerTeamTools(ctx, options) {
     },
   )
 
+  function parseToolJson(raw) {
+    try {
+      return JSON.parse(raw)
+    } catch {
+      return { status: 'failed', error: String(raw) }
+    }
+  }
+
+  /**
+   * 重启恢复：按链恢复排队/中断的任务。
+   * - 排队任务：依赖已满足就原地启动，保持原 taskId，下游引用不断。
+   * - 中断任务：重派新 taskId，把下游依赖改到新号；旧行标 supersededBy。
+   * - 恢复不了的依赖标空，下游受阻，不偷偷跳过。
+   */
+  async function resumeTasks(args, exec) {
+    const one = String(args?.taskId ?? '').trim()
+    const chain = String(args?.chainId ?? '').trim()
+    const target = one === '' ? null : tasks?.get(one) ?? null
+    if (one !== '' && !target) return { status: 'failed', error: '没有这个任务' }
+    const scopeChain = chain || target?.chainId || ''
+    let rows = [...(tasks?.values?.() ?? [])].filter((row) => {
+      if (!row?.restartInterrupted) return false
+      if (row?.supersededBy) return false
+      if (!['queued', 'interrupted'].includes(row.status)) return false
+      if (scopeChain !== '') return row.chainId === scopeChain
+      return true
+    })
+    if (rows.length === 0) return { status: 'failed', error: '没有可恢复的任务' }
+
+    // 先按链内依赖排序；有环就不恢复，宁可报错也不乱跑。
+    const selected = new Map(rows.map((row) => [row.taskId, row]))
+    const order = []
+    const mark = new Map()
+    const visit = (id) => {
+      if (mark.get(id) === 2) return true
+      if (mark.get(id) === 1) return false
+      const row = selected.get(id)
+      if (!row) return true
+      mark.set(id, 1)
+      for (const dep of row.dependsOn ?? []) {
+        if (selected.has(dep) && !visit(dep)) return false
+      }
+      mark.set(id, 2)
+      order.push(row)
+      return true
+    }
+    for (const row of rows) {
+      if (!visit(row.taskId)) return { status: 'failed', error: '链上有循环依赖，不能恢复' }
+    }
+
+    const mapping = new Map()
+    const results = []
+    for (const row of order) {
+      const deps = remapDependsOn(row.dependsOn, mapping)
+      const states = deps.map((id) => dependencyState(tasks?.get(id), row.dependsOnMode ?? 'done'))
+      const firstBad = deps.find((_, index) => states[index] !== 'ok')
+      if (row.status === 'queued') {
+        if (firstBad) {
+          // 上游还没好：留在队列里，等定时恢复再试，不标 blocked。
+          mapping.set(row.taskId, row.taskId)
+          results.push({ from: row.taskId, status: 'queued', message: `还在等 ${firstBad}` })
+          continue
+        }
+        const brief = row.brief ?? {}
+        const raw = await dispatchTask(
+          {
+            ...brief,
+            bot: row.bot,
+            dependsOn: deps,
+            dependsOnMode: row.dependsOnMode,
+            chainId: row.chainId,
+            review: row.review === true,
+            __taskId: row.taskId,
+            __fromQueue: true,
+          },
+          exec,
+        )
+        const parsed = parseToolJson(raw)
+        if (parsed?.status === 'failed' || parsed?.status === 'blocked') {
+          mapping.set(row.taskId, '')
+          results.push({ from: row.taskId, status: parsed?.status ?? 'failed', message: parsed?.error ?? parsed?.message })
+        } else {
+          mapping.set(row.taskId, row.taskId)
+          row.restartInterrupted = false
+          row.note = '重启恢复：排队任务已启动'
+          results.push({ from: row.taskId, to: row.taskId, status: parsed?.status ?? 'running' })
+        }
+        continue
+      }
+
+      if (firstBad) {
+        const reason = `恢复中断任务时依赖没满足：${firstBad}`
+        markBlocked(row.taskId, row.bot, row.parentSession, row.brief ?? {}, deps, reason, {
+          dependsOnMode: row.dependsOnMode,
+          chainId: row.chainId,
+        })
+        mapping.set(row.taskId, '')
+        results.push({ from: row.taskId, status: 'blocked', message: reason })
+        continue
+      }
+      const brief = row.brief ?? {}
+      const raw = await dispatchTask(
+        {
+          ...brief,
+          bot: row.bot,
+          dependsOn: deps,
+          dependsOnMode: row.dependsOnMode,
+          chainId: row.chainId,
+          review: row.review === true,
+          retryNote: '进程重启时这件活被中断了。先检查已有产物，从断点继续；不要重复已经做完的步骤。',
+        },
+        exec,
+      )
+      const parsed = parseToolJson(raw)
+      if (parsed?.status === 'failed' || parsed?.status === 'blocked') {
+        mapping.set(row.taskId, '')
+        results.push({ from: row.taskId, status: parsed?.status ?? 'failed', message: parsed?.error ?? parsed?.message })
+      } else {
+        const next = String(parsed?.taskId ?? '').trim()
+        mapping.set(row.taskId, next)
+        row.supersededBy = next
+        row.note = `重启后已恢复为 ${next || '未知'}`
+        if (next !== '') {
+          const fresh = tasks?.get(next)
+          if (fresh) fresh.continuesFrom = row.taskId
+        }
+        results.push({ from: row.taskId, to: next, status: parsed?.status ?? 'running' })
+      }
+    }
+
+    // 没启动的排队任务，把依赖改到映射后的新号；映射为空则保留原号，等下一次恢复。
+    for (const row of rows) {
+      if (row.status !== 'queued') continue
+      if (!mapping.has(row.taskId)) continue
+      const next = remapDependsOn(row.dependsOn, mapping)
+      row.dependsOn = next
+    }
+    void persistTasks?.()
+    options.api?.broadcast?.({ type: 'tasks' })
+    await debug?.({ event: 'resume-restart', count: results.length, results })
+    return { status: 'done', count: results.length, results }
+  }
+
   const resumeTools = tools.register(
     {
       name: 'team_resume',
-      description: '重启后把因进程中断而卡住的任务按原任务单重新派一遍。只处理 restartInterrupted 的行；新任务号，旧行保留并标 supersededBy。',
+      description: '重启后恢复整链：排队任务原地启动，中断任务重派并把下游依赖改到新任务号。可指定 taskId 或 chainId。',
       parameters: {
-        taskId: { type: 'string', description: '只恢复这一件；不填则恢复全部可恢复的。' },
+        taskId: { type: 'string', description: '只恢复这个任务所在的链；不填则恢复全部可恢复任务。' },
+        chainId: { type: 'string', description: '只恢复这条链。' },
       },
       output: {
         schema: { type: 'string' },
         render: (_args, value) => [{ type: 'text', text: String(value) }],
       },
       async execute(args, exec) {
-        const one = String(args?.taskId ?? '').trim()
-        const rows = [...(tasks?.values?.() ?? [])].filter((row) => {
-          if (one !== '' && row?.taskId !== one) return false
-          if (!row?.restartInterrupted) return false
-          return !row?.supersededBy
-        })
-        if (rows.length === 0) return JSON.stringify({ status: 'failed', error: '没有可恢复的任务' })
-        const results = []
-        for (const row of rows) {
-          const brief = row?.brief ?? {}
-          const raw = await dispatchTask(
-            {
-              ...brief,
-              bot: row.bot,
-              dependsOn: row.dependsOn,
-              dependsOnMode: row.dependsOnMode,
-              chainId: row.chainId,
-            },
-            exec,
-          )
-          let parsed = null
-          try {
-            parsed = JSON.parse(raw)
-          } catch {
-            parsed = { status: 'failed', output: String(raw) }
-          }
-          row.supersededBy = parsed?.taskId ?? ''
-          row.note = `重启后已重新派为 ${parsed?.taskId ?? '未知'}`
-          results.push({ from: row.taskId, to: parsed?.taskId, status: parsed?.status, message: parsed?.message })
-        }
-        void persistTasks?.()
-        options.api?.broadcast?.({ type: 'tasks' })
-        await debug?.({ event: 'resume-restart', count: results.length, results })
-        return JSON.stringify({ status: 'done', count: results.length, results })
+        const result = await resumeTasks(args, exec)
+        return JSON.stringify(result)
       },
     },
     {
@@ -3681,6 +3808,64 @@ export function registerTeamTools(ctx, options) {
         return { ok: false, error: String(raw) }
       }
     }
+
+    options.api.resume = async ({ taskId, chainId } = {}) => {
+      const id = String(taskId ?? '').trim()
+      const chain = String(chainId ?? '').trim()
+      const ref = id === '' ? null : tasks?.get(id) ?? null
+      const scope = chain || ref?.chainId || ''
+      const candidates = [...(tasks?.values?.() ?? [])].filter((row) => {
+        if (scope !== '') return row.chainId === scope
+        return row.taskId === id
+      })
+      let parent = null
+      for (const row of candidates) {
+        if (!row?.parentSession) continue
+        try {
+          parent = agents?.get?.(row.parentSession) ?? null
+        } catch {
+          parent = null
+        }
+        if (parent) break
+      }
+      if (!parent) return { ok: false, error: '父会话不在线，恢复需要秘书在场' }
+      await debug?.({ event: 'resume-http', taskId: id, chainId: scope })
+      const controller = new AbortController()
+      return resumeTasks({ taskId: id, chainId: scope }, { agent: parent, signal: controller.signal })
+    }
+
+    // 排队任务自动恢复：进程重启后，等父会话重新上线，再原地启动。
+    // 运行中的任务不自动续跑，交给「恢复整链」按钮，避免重复副作用。
+    let autoResuming = false
+    let autoResumeTimer = null
+    const autoResumeQueued = async () => {
+      if (autoResuming) return
+      autoResuming = true
+      try {
+        for (const row of [...(tasks?.values?.() ?? [])]) {
+          if (row.status !== 'queued' || !row.restartInterrupted || row.supersededBy) continue
+          if (!row.parentSession) continue
+          let parent = null
+          try {
+            parent = agents?.get?.(row.parentSession) ?? null
+          } catch {
+            parent = null
+          }
+          if (!parent) continue
+          if (typeof isTeamSession === 'function' && !isTeamSession(row.parentSession)) continue
+          await resumeTasks(
+            { taskId: row.taskId, chainId: row.chainId },
+            { agent: parent, signal: new AbortController().signal },
+          )
+        }
+      } finally {
+        autoResuming = false
+      }
+    }
+    const firstAuto = setTimeout(autoResumeQueued, 2000)
+    firstAuto.unref?.()
+    autoResumeTimer = setInterval(autoResumeQueued, 15000)
+    autoResumeTimer.unref?.()
   }
 
   return () => {

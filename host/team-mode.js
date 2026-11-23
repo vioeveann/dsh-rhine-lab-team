@@ -45,6 +45,7 @@ const IDENTITY_MAP_ROUTE = '/dsh-team/identity-map'
 const DIAG_ROUTE = '/dsh-team/diag'
 const CONFIG_ROUTE = '/dsh-team/config'
 const RETRY_ROUTE = '/dsh-team/retry'
+const RESUME_ROUTE = '/dsh-team/resume'
 const CANCEL_ROUTE = '/dsh-team/cancel'
 const CLEAN_ROUTE = '/dsh-team/tasks-clean'
 const TEAM_BOTS_ROUTE = '/dsh-team/team-bots'
@@ -402,6 +403,8 @@ export function installTeamMode(ctx, options) {
             dependsOn: Array.isArray(entry.dependsOn) ? entry.dependsOn : [],
             dependsOnMode: entry.dependsOnMode ?? 'done',
             chainId: entry.chainId ?? entry.taskId ?? '',
+            restartInterrupted: entry.restartInterrupted === true,
+            supersededBy: entry.supersededBy ?? '',
             blockedBy: entry.blockedBy ?? '',
             review: entry.review === true,
             reviewOf: entry.reviewOf ?? '',
@@ -444,6 +447,8 @@ export function installTeamMode(ctx, options) {
             dependsOn: Array.isArray(entry.dependsOn) ? entry.dependsOn : [],
             dependsOnMode: entry.dependsOnMode ?? 'done',
             chainId: entry.chainId ?? entry.taskId ?? '',
+            restartInterrupted: entry.restartInterrupted === true,
+            supersededBy: entry.supersededBy ?? '',
             blockedBy: entry.blockedBy ?? '',
             review: entry.review === true,
             reviewOf: entry.reviewOf ?? '',
@@ -1301,6 +1306,29 @@ export function installTeamMode(ctx, options) {
     },
   })
 
+  const disposeResume = registerRoute({
+    kind: 'exact',
+    path: RESUME_ROUTE,
+    async handler(req, res) {
+      if (req.method !== 'POST') {
+        res.writeHead(405, { allow: 'POST' })
+        res.end()
+        return
+      }
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        if (typeof api?.resume !== 'function') {
+          json(res, 503, { ok: false, error: '恢复接口没接上（插件可能刚重载）' })
+          return
+        }
+        const result = await api.resume({ taskId: body.taskId, chainId: body.chainId })
+        json(res, 200, result ?? { ok: false, error: '恢复接口没接上' })
+      } catch (error) {
+        json(res, 400, { ok: false, error: String(error?.message ?? error) })
+      }
+    },
+  })
+
   const disposeConfig = registerRoute({
     kind: 'exact',
     path: CONFIG_ROUTE,
@@ -1597,6 +1625,7 @@ export function installTeamMode(ctx, options) {
       disposeClean()
       disposeCancel()
       disposeRetry()
+      disposeResume()
       disposeConfig()
       disposeDiag()
       disposeExport()

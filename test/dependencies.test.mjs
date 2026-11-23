@@ -459,6 +459,47 @@ test('取消排队的验收门任务后，上游验收也不会把它偷偷启�
   }
 })
 
+test('team_resume：整链恢复，中断任务换号，下游依赖跟着改', async () => {
+  const { root, cleanup } = await fixture()
+  try {
+    const tools = fakeTools()
+    const subagents = stubSubagents()
+    const opts = options(tools, root, subagents)
+    registerTeamTools({}, opts)
+    opts.tasks.set('t-old', {
+      taskId: 't-old',
+      bot: 'a',
+      status: 'interrupted',
+      parentSession: 'session-test',
+      chainId: 't-old',
+      brief: { task: '先采集' },
+      restartInterrupted: true,
+      doneAt: Date.now(),
+    })
+    opts.tasks.set('t-next', {
+      taskId: 't-next',
+      bot: 'b',
+      status: 'queued',
+      parentSession: 'session-test',
+      chainId: 't-old',
+      dependsOn: ['t-old'],
+      brief: { task: '再写作' },
+      restartInterrupted: true,
+    })
+    const resume = definitionOf(tools, 'team_resume')
+    const result = JSON.parse(await run(resume, { chainId: 't-old' }))
+    assert.equal(result.status, 'done')
+    assert.ok(subagents.calls.includes('a'))
+    assert.ok(subagents.calls.includes('b'))
+    const next = opts.tasks.get('t-next')
+    assert.ok(next, '下游任务丢了')
+    assert.notEqual(next.dependsOn?.[0], 't-old', '下游依赖没改到新任务号')
+    assert.ok(opts.tasks.get(next.dependsOn?.[0]), '新任务号不在账本里')
+  } finally {
+    await cleanup()
+  }
+})
+
 test('team_dispatch：有交付物的活自动建审计任务，审计未过不能验收', async () => {
   const { root, cleanup } = await fixture()
   try {

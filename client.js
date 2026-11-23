@@ -243,6 +243,7 @@ window.__ModuleLoader__.load({
       failed: { label: '失败', tone: 'bad' },
       cancelled: { label: '已取消', tone: 'muted' },
       timeout: { label: '超时', tone: 'warn' },
+      interrupted: { label: '已中断', tone: 'warn' },
     }
 
     /**
@@ -5986,6 +5987,47 @@ function createMembersPanel(React, host) {
             h('span', { style: { fontWeight: 600, fontSize: 12, color: p.text } }, detail.taskId),
             h('span', { style: { color: p.faint } }, `${detail.bot} · ${detail.status}`),
             h('span', { style: { marginLeft: 'auto' } }),
+            detail.restartInterrupted === true || detail.status === 'interrupted'
+              ? h(
+                  'button',
+                  {
+                    type: 'button',
+                    disabled: retrying,
+                    title: '恢复这条链：排队任务原地启动，中断任务重新派',
+                    onClick: async () => {
+                      setRetrying(true)
+                      setNotice('恢复中…')
+                      try {
+                        const response = await fetch('/dsh-team/resume', {
+                          method: 'POST',
+                          headers: { 'content-type': 'application/json' },
+                          body: JSON.stringify({ taskId: detail.taskId, chainId: detail.chainId }),
+                        })
+                        const data = await response.json()
+                        setNotice(
+                          data?.ok === false || data?.status === 'failed'
+                            ? (data.error ?? data.message ?? '恢复失败')
+                            : `恢复结果：${data?.count ?? 0} 件`,
+                        )
+                      } catch (error) {
+                        setNotice(`恢复失败：${error?.message ?? error}`)
+                      } finally {
+                        setRetrying(false)
+                      }
+                    },
+                    style: {
+                      padding: '3px 8px',
+                      fontSize: 11,
+                      color: p.text,
+                      background: 'transparent',
+                      border: `1px solid ${p.line}`,
+                      borderRadius: aurora ? 2 : 4,
+                      cursor: retrying ? 'wait' : 'pointer',
+                    },
+                  },
+                  '恢复整链',
+                )
+              : null,
             h(
               'button',
               {

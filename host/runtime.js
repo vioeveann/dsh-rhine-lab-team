@@ -155,18 +155,16 @@ async function loadTasks() {
         row.doneAt = row.startedAt ?? Date.now()
       }
       if (row.status === 'running' && !row.doneAt) {
-        row.status = 'failed'
+        row.status = 'interrupted'
         row.doneAt = Date.now()
         row.restartInterrupted = true
-        row.note = row.note || '进程重启时中断'
+        row.note = row.note || '进程重启时中断，等手动恢复整链'
       }
-      // 排队等依赖的任务没起过子会话，重启后不可能自己再开：标受阻，让用户重派。
+      // 排队等依赖的任务没起过子会话，重启后保留在队列里；
+      // 秘书下次打开团队会话时自动尝试恢复，不需要重新派。
       if (row.status === 'queued' && !row.doneAt) {
-        row.status = 'blocked'
-        row.doneAt = Date.now()
         row.restartInterrupted = true
-        row.blockedBy = row.blockedBy || '进程重启时还在排队，没有开始'
-        row.note = row.note || row.blockedBy
+        row.note = row.note || '进程重启时仍在排队，等待自动恢复'
       }
       tasks.set(row.taskId, row)
     }

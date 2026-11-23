@@ -82,7 +82,7 @@ node --check host/*.js
 
 `team_dispatch` 和 `team_dispatch_many` 接受 `dependsOn`：一个任务号数组（也接受 JSON 字符串或逗号分隔）。批量里每项还可以给 `key`，同批其他项的 `dependsOn` 直接写 key，不必先知道真实任务号。
 
-调度是 DAG-lite：同一批内部按拓扑顺序跑，就绪的任务按并发上限并行；默认上游 `ready` 或 `accepted` 就放行，`dependsOnMode: 'accepted'` 时上游必须验收通过。上游 `failed` / `rejected` / `timeout` / `blocked`，下游直接写 `blocked` 账本行，不 spawn。等外部依赖超过 `max(60s, 2×单任务超时)` 会整批标 blocked，不无限挂住。批量可传 `chainTimeoutSec`，整链超时后未开始的下游标 blocked；`team_cancel` 传 `chain: true` 整链中止。重启时没开始的 `queued` 转 `blocked`、`running` 转 `failed`，都带 `restartInterrupted`，`team_resume` 可按原任务单重派。
+调度是 DAG-lite：同一批内部按拓扑顺序跑，就绪的任务按并发上限并行；默认上游 `ready` 或 `accepted` 就放行，`dependsOnMode: 'accepted'` 时上游必须验收通过。上游 `failed` / `rejected` / `timeout` / `blocked`，下游直接写 `blocked` 账本行，不 spawn。等外部依赖超过 `max(60s, 2×单任务超时)` 会整批标 blocked，不无限挂住。批量可传 `chainTimeoutSec`，整链超时后未开始的下游标 blocked；`team_cancel` 传 `chain: true` 整链中止。重启时没开始的 `queued` 保留在队列，等父会话回来后自动恢复；跑到一半的标 `interrupted`，在任务详情点「恢复整链」：排队任务原地启动，中断任务重派并把下游依赖改到新任务号，恢复不了的依赖让下游受阻。
 
 ## 强制审查链
 

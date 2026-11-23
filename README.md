@@ -85,7 +85,7 @@ dsh plugin add https://github.com/vioeveann/dsh-rhine-lab-team
 - 上游默认 `ready` 就放行；加 `dependsOnMode: "accepted"` 后，必须验收通过才放行。
 - 上游 `failed` / `rejected` / `timeout` / `blocked`，下游记 `blocked`，原因写进账本和任务详情，不会拉起子会话。
 - 批量可加 `chainTimeoutSec`，整条链超时后没开始的任务直接 `blocked`；`team_cancel` 传 `chain: true` 可整链中止。
-- 排队等依赖的任务不占并发名额；DSH 重启时还没开始的 `queued` / `running` 会标 `blocked` / `failed`，并保留任务单，可用 `team_resume` 按原单重派。
+- 排队等依赖的任务不占并发名额；DSH 重启时没开始的 `queued` 会自动恢复，跑到一半的标 `interrupted`，在任务详情点「恢复整链」按原单续跑或重派。
 - 面板「最近任务」右侧有「依赖图」，按链画出节点和箭头，只读。
 
 ## 成员信箱
