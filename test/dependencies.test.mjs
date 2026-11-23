@@ -38,14 +38,17 @@ async function fixture() {
  */
 function stubSubagents(options = {}) {
   const calls = []
+  const signals = []
   let active = 0
   const maxActive = { value: 0 }
   return {
     calls,
+    signals,
     maxActive,
     async startActivation(activation) {
       const bot = String(activation?.name ?? '').split('-')[0]
       calls.push(bot)
+      signals.push(activation?.signal)
       active += 1
       maxActive.value = Math.max(maxActive.value, active)
       const delay = options.delayMs ?? 10
@@ -474,6 +477,8 @@ test('team_dispatch：有交付物的活自动建审计任务，审计未过不�
     }
     assert.ok(audit, '没有自动生成审计任务')
     assert.equal(audit.bot, 'auditor')
+    const auditCall = subagents.calls.lastIndexOf('auditor')
+    assert.ok(auditCall >= 0 && subagents.signals[auditCall], '自动审计任务必须带 AbortSignal')
     const review = definitionOf(tools, 'team_review')
     const blocked = JSON.parse(await run(review, { taskId: raw.taskId, verdict: 'accepted', grade: 'good' }))
     assert.equal(blocked.ok, false)

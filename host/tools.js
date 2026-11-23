@@ -1283,6 +1283,7 @@ export function registerTeamTools(ctx, options) {
       '按固定清单检查：产物存在、数字可核、口径写清、引用有出处、没有不确定装确定。只挑问题，不改文件。',
       '结论写清楚：通过，或不通过并逐条列必须改。',
     ].join('\n')
+    const reviewAbort = new AbortController()
     void dispatchTask({
       bot: AUDITOR_ID,
       task: prompt,
@@ -1294,7 +1295,7 @@ export function registerTeamTools(ctx, options) {
       dependsOn: [entry.taskId],
       dependsOnMode: 'done',
       chainId: entry.chainId ?? entry.taskId,
-    }, { ...exec, signal: undefined }).catch((error) => {
+    }, { ...exec, signal: reviewAbort.signal }).catch((error) => {
       entry.reviewTaskId = ''
       void persistTasks?.()
       void debug?.({ event: 'review-queue', ok: false, taskId: entry.taskId, error: String(error?.message ?? error) })
