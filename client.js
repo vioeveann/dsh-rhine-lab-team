@@ -3400,11 +3400,10 @@ function createMembersPanel(React, host) {
       field("能力卡 · 只给这些工具（逗号分隔，留空=不限制）", "allow"),
       field("能力卡 · 禁用这些工具（逗号分隔）", "deny"),
       // 人设：只有 soul.txt 一份，面板里不再摆正文，只给一行状态 + 打开文件。
-      // 正文去文件里看；这里只要回答两个问题：写了没有、多长。
+      // 不要标签：「编辑人设」四个字已经把这段的意思说完了。
       h(
         "div",
         { style: { display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", fontSize: 10, color: RECRUIT_LIGHT.muted } },
-        h("span", null, "人设"),
         h("button", {
           type: "button",
           onClick: openPersona,
