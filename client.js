@@ -3399,46 +3399,31 @@ function createMembersPanel(React, host) {
       ),
       field("能力卡 · 只给这些工具（逗号分隔，留空=不限制）", "allow"),
       field("能力卡 · 禁用这些工具（逗号分隔）", "deny"),
-      // 人设：只有 soul.txt 一份。默认给预览 + 打开文件；系统没有 .md 关联时用面板里改。
+      // 人设：只有 soul.txt 一份，面板里不再摆正文，只给一行状态 + 打开文件。
+      // 正文去文件里看；这里只要回答两个问题：写了没有、多长。
       h(
         "div",
-        { style: { display: "flex", flexDirection: "column", gap: 3, fontSize: 10, color: RECRUIT_LIGHT.muted } },
-        h("span", null, "人设（memory/soul.txt）"),
-        h(
-          "div",
-          {
-            style: {
-              maxHeight: 96,
-              overflowY: "auto",
-              padding: "4px 6px",
-              fontSize: 10,
-              lineHeight: "15px",
-              whiteSpace: "pre-wrap",
-              color: persona.text.trim() === "" ? RECRUIT_LIGHT.muted : RECRUIT_LIGHT.text,
-              background: RECRUIT_LIGHT.field,
-              border: `1px solid ${RECRUIT_LIGHT.line}`,
-            },
+        { style: { display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", fontSize: 10, color: RECRUIT_LIGHT.muted } },
+        h("span", null, "人设"),
+        h("button", {
+          type: "button",
+          onClick: openPersona,
+          style: {
+            padding: "3px 10px",
+            fontSize: 10,
+            fontWeight: 700,
+            color: RECRUIT_LIGHT.onAccent,
+            background: RECRUIT_LIGHT.accent,
+            border: `1px solid ${RECRUIT_LIGHT.accent}`,
+            cursor: "pointer",
           },
-          persona.text.trim() === "" ? "还没有写人设——点「编辑人设」打开文件写。" : persona.text.trim(),
-        ),
+        }, "编辑人设"),
         h(
-          "div",
-          { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } },
-          h("button", {
-            type: "button",
-            onClick: openPersona,
-            style: {
-              padding: "3px 10px",
-              fontSize: 10,
-              fontWeight: 700,
-              color: RECRUIT_LIGHT.onAccent,
-              background: RECRUIT_LIGHT.accent,
-              border: `1px solid ${RECRUIT_LIGHT.accent}`,
-              cursor: "pointer",
-            },
-          }, "编辑人设"),
-          persona.note ? h("span", { style: { fontSize: 10, color: RECRUIT_LIGHT.muted } }, persona.note) : null,
+          "span",
+          { style: { color: persona.text.trim() === "" ? RECRUIT_LIGHT.muted : RECRUIT_LIGHT.text } },
+          persona.text.trim() === "" ? "还没有写" : `已写 ${Array.from(persona.text).length} 字`,
         ),
+        persona.note ? h("span", { style: { fontSize: 10, color: RECRUIT_LIGHT.muted } }, persona.note) : null,
       ),
       h(
         "div",
