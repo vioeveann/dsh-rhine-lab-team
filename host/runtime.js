@@ -19,8 +19,15 @@ import { ensureBuiltinBots } from './builtin-bots.js'
 import { installTeamMode, readRoster } from './team-mode.js'
 import { loadSettings, resolveDeliverableRoot, saveSettings } from './settings.js'
 import { createUsageBook } from './usage.js'
+import { migrateDataRoot, resolveDataRoot } from './paths.js'
 
-const ROOT = fileURLToPath(new URL('..', import.meta.url))
+/** 插件包目录：只放代码，不放数据。升级时它会被整个替换。 */
+const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url))
+/** 数据目录：Bot 名册、记忆、头像、账本都在这儿，升级不会动它。 */
+const ROOT = resolveDataRoot()
+/** 老版本把数据放在包目录里；启动时搬一次，别让升级把用户的 Bot 抹掉。 */
+const MIGRATED = await migrateDataRoot(PACKAGE_ROOT, ROOT)
+
 const DEBUG_DIR = join(ROOT, '.debug')
 const CONFIG_FILE = join(ROOT, '.state', 'config.json')
 
@@ -177,7 +184,10 @@ async function debug(line) {
  */
 export async function apply(ctx, config = {}) {
   const enabled = config.enabled !== false
-  await debug({ event: 'apply', enabled, root: ROOT })
+  await debug({ event: 'apply', enabled, root: ROOT, package: PACKAGE_ROOT })
+  if (MIGRATED.length > 0) {
+    await debug({ event: 'data-migrated', from: PACKAGE_ROOT, to: ROOT, entries: MIGRATED })
+  }
   await loadTasks()
   if (!enabled) return
 

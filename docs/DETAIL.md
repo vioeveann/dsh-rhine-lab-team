@@ -177,6 +177,23 @@ Bot 的子会话**拿不到 dsh-team 的团队工具**：这些工具的可用�
 
 有上传头像就原样发；没有的话 `/dsh-team/avatar` 不返回 404，而是现场画一张 128×128 的 SVG 占位图：一张极简工牌（浅色底）：挂绳夹 + 暖白卡套（不纯白）+ 卡面写 BOT（米色标题块 / 红条 / 金条 / 底部色块），所有 Bot 共用同一张。子会话里（dsh-avatar-frame）因此不会出现裂图。
 
+## 数据放在哪
+
+插件本体是 npm 包，升级/重装/换版本都会把包目录整个替换掉。所以**运行期数据一律不放包目录**：
+
+```
+$DSH_TEAM_HOME/                       默认 $DSH_HOME/rhine-lab-team（`~/.dsh/rhine-lab-team`）
+  bots/<id>.json                      名册定义
+  bots/<id>/memory/soul.txt           人设
+  bots/<id>/memory/project.md         项目记忆
+  bots/<id>/avatar.*  background.*    头像、卡片背景
+  .state/                             设置、任务账本、团队分组、团队知识库状态
+  .debug/host.log                     运行日志
+  .team-work/<bot>/<task>/            单聊与任务的工作目录
+```
+
+0.4.x 及更早把 `bots/`、`.state/`、`.debug/` 直接放在包目录里，`0.5.0` 升级时整包被替换，用户自建的 Bot 随之消失。`0.5.1` 起启动时会把包目录里残留的这三样搬到数据目录，只搬目标不存在的，搬完不删旧目录。
+
 ## 人设只认 soul.txt
 
 人设就是 `bots/<id>/memory/soul.txt` 一份，**JSON 里不再存 `persona`**。装饰子会话时注入的顺序是 `intro + 团队记忆 + soul.txt`；如果 JSON 里还有旧的 `persona`，会在插件加载时一次性迁进 `soul.txt`（文件里已有真内容时以文件为准，占位句才用旧的填），然后从 JSON 删掉——否则两处各写一半，改了不生效。
