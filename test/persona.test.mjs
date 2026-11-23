@@ -106,6 +106,14 @@ test('装饰子会话时只注入 soul.txt，不再读 JSON 里的 persona', asy
   assert.ok(persona, '没注入人设段')
   assert.match(persona.text, /文件里的人设/)
   assert.doesNotMatch(persona.text, /JSON 里的旧人设/)
+
+  // AGENTS.md 是宿主塞的用户消息，删不掉，只能在 system prompt 里压过它。
+  const scope = sections.find((section) => section.name === 'dsh-team/scope')
+  assert.ok(scope, '没注入会话范围段')
+  assert.equal(scope.order, 121)
+  assert.ok(scope.order > persona.order, '会话范围段必须排在人设段后面')
+  assert.match(scope.text, /AGENTS\.md/)
+  assert.match(scope.text, /以本段为准/)
 })
 
 test('占位句下面接着写的人设不会被丢掉：只丢占位那一行和抬头', async () => {

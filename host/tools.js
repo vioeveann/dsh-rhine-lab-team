@@ -55,7 +55,7 @@ const AUDIT_BRIEF = `
 - 输出一页以内：结论（通过 / 不通过）+ 问题清单（位置、问题、依据、改法）；没有必须改就写「无必须改」。
 - 必查五条：①交付物存在、非空、数量与任务单一致（缺了直接不通过）；②数字与原文一致；③出处能落到材料的具体节或行；④口径有来源，不许把自定口径说成官方口径；⑤无法确认的写「不确定」。`
 import { DEFAULT_SPEECH, extractPersonaSpeech } from './speech.js'
-import { BASE_RULES, BASE_RULES_ORDER, BASE_RULES_SECTION } from './base-rules.js'
+import { BASE_RULES, BASE_RULES_ORDER, BASE_RULES_SECTION, SCOPE_ORDER, SCOPE_RULES, SCOPE_SECTION } from './base-rules.js'
 import { usageOfFrame } from './usage.js'
 
 /** Prompt section name used for a bot persona. */
@@ -3009,6 +3009,13 @@ export function installChildDecoration(ctx, options) {
         name: PERSONA_SECTION,
         order: 120,
         text,
+      })
+      // 会话范围单列一段、排在人设之后：AGENTS.md 是宿主塞进来的用户消息，插件删不掉，
+      // 只能在 system prompt 里把「哪一份设定说了算」写死。
+      agent.ctx.systemPrompt.section({
+        name: SCOPE_SECTION,
+        order: SCOPE_ORDER,
+        text: SCOPE_RULES,
       })
       await debug?.({ event: 'persona', bot: hit.bot.id, ok: true, soul: Boolean(soul), rules: true })
 
