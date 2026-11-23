@@ -1173,7 +1173,7 @@ function createMembersPanel(React, host) {
   }
 
   /**
-   * 同组内的排序：星级高的在前；同星看等级；同星同级看谁先到这个等级。
+   * 同组内的排序：星级高的在前；同星看段位；同段位看等级；同级看谁先到这个等级。
    * @param items - 组内成员。
    */
   function sortGroupItems(items) {
@@ -1181,6 +1181,9 @@ function createMembersPanel(React, host) {
       const starsA = Number(a?.stars) || 0
       const starsB = Number(b?.stars) || 0
       if (starsA !== starsB) return starsB - starsA
+      const rankA = Number(a?.rank) || 0
+      const rankB = Number(b?.rank) || 0
+      if (rankA !== rankB) return rankB - rankA
       const lvA = Number(a?.lv) || 0
       const lvB = Number(b?.lv) || 0
       if (lvA !== lvB) return lvB - lvA
@@ -6359,15 +6362,14 @@ function createMembersPanel(React, host) {
             'div',
             {
               style: {
-                // 成员少的时候让最近任务把剩下的高度吃满；成员多时仍只占
-                // 一块，给上面的名单留空间。原来的 18vh 会在这两种情况下
-                // 都留下一条空白。
-                flex: members.length <= 3 ? '1 1 auto' : '0 0 auto',
-                minHeight: 0,
+                // 最近任务吃掉成员名单之外剩下的高度；空间不够时收缩并内部滚动，
+                // 不再固定 18vh 留一条空白。成员多时名单自己滚动，不用任务区让位。
+                flex: '1 1 auto',
+                minHeight: 70,
                 display: 'flex',
                 flexDirection: 'column',
                 gap: 3,
-                maxHeight: members.length <= 3 ? 'none' : '18vh',
+                maxHeight: 'none',
                 overflowY: 'auto',
                 borderTop: `1px solid ${p.line}`,
                 paddingTop: 8,
