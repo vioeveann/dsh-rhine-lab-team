@@ -262,7 +262,7 @@ $DSH_TEAM_HOME/                       默认 $DSH_HOME/rhine-lab-team（`~/.dsh/
 3. **看 `team_health`**：在跑几件、几件等你验收、最慢的一件是哪件。运行中的任务卡住时，插件会自己问、两次没回应会停掉再问。
 4. **看数据目录**：默认 `~/.dsh/rhine-lab-team`（`DSH_TEAM_HOME` 可覆盖）。`bots/` 是名册与人设，`.state/tasks.json` 是任务账本，`.state/settings.json` 是设置，`.team-work/` 是任务工作目录，`mailbox/messages.jsonl` 是成员信箱。
 5. **看日志**：`.debug/host.log` 按行记 JSON 事件；`continue-wait`、`wake-blocked`、`cancel`、`review` 这几个事件名能直接搜。开 Issue 时贴最后 50 行和 `package.json` 版本号。
-6. **开发自检**：`npm run check` 检查所有 JS 语法，`npm test` 跑 328 条；修完先跑这两个，再看面板。
+6. **开发自检**：`npm run check` 检查所有 JS 语法，`npm test` 跑 330 条；修完先跑这两个，再看面板。
 
 常见现象：
 
