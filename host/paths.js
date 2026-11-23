@@ -13,8 +13,16 @@ import { cp, mkdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-/** 包目录里可能残留的运行期数据；按这个顺序搬。 */
-export const LEGACY_ENTRIES = ['bots', '.state', '.debug']
+/**
+ * 包目录里可能残留的运行期数据；按这个顺序搬。
+ *
+ * 只要用户在面板里能改的东西，都在这几样里，升级一律不许丢：
+ *  - `bots/`        名册、人设（soul.txt）、项目记忆、头像、卡片背景、团队知识库（`bots/_team`）
+ *  - `.state/`      设置、自定义分组、会话级队伍、任务账本、用量、自带 Bot 的种植记录
+ *  - `.team-work/`  单聊与任务的工作目录
+ *  - `.debug/`      运行日志（不是用户内容，但一起搬过去省得两处翻）
+ */
+export const LEGACY_ENTRIES = ['bots', '.state', '.team-work', '.debug']
 
 /**
  * 解析数据目录。

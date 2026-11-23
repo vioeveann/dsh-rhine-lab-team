@@ -43,14 +43,22 @@ test('migrateDataRoot：包目录里的旧 Bot 搬到数据目录，不覆盖已
   const pkg = join(base, 'package')
   const data = join(base, 'data')
   await mkdir(join(pkg, 'bots', 'nova', 'memory'), { recursive: true })
+  await mkdir(join(pkg, 'bots', '_team'), { recursive: true })
   await mkdir(join(pkg, '.state'), { recursive: true })
+  await mkdir(join(pkg, '.team-work', 'nova', 'chat-1'), { recursive: true })
   await writeFile(join(pkg, 'bots', 'nova.json'), JSON.stringify({ id: 'nova', name: 'Nova', role: '研究员' }), 'utf8')
+  await writeFile(join(pkg, 'bots', '_team', 'knowledge.md'), '团队知识', 'utf8')
   await writeFile(join(pkg, '.state', 'config.json'), '{"address":"博士"}', 'utf8')
+  await writeFile(join(pkg, '.state', 'groups.json'), '{"groups":[{"name":"我的组"}]}', 'utf8')
+  await writeFile(join(pkg, '.team-work', 'nova', 'chat-1', 'note.txt'), '工作目录', 'utf8')
 
   const moved = await migrateDataRoot(pkg, data)
-  assert.deepEqual(moved.sort(), ['.state', 'bots'])
+  assert.deepEqual(moved.sort(), ['.state', '.team-work', 'bots'])
   assert.match(await readFile(join(data, 'bots', 'nova.json'), 'utf8'), /Nova/)
+  assert.match(await readFile(join(data, 'bots', '_team', 'knowledge.md'), 'utf8'), /团队知识/)
   assert.match(await readFile(join(data, '.state', 'config.json'), 'utf8'), /博士/)
+  assert.match(await readFile(join(data, '.state', 'groups.json'), 'utf8'), /我的组/)
+  assert.match(await readFile(join(data, '.team-work', 'nova', 'chat-1', 'note.txt'), 'utf8'), /工作目录/)
   // 旧目录留着：不替用户删数据。
   assert.match(await readFile(join(pkg, 'bots', 'nova.json'), 'utf8'), /Nova/)
 
