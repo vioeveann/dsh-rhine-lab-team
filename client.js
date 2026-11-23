@@ -5213,7 +5213,8 @@ function createMembersPanel(React, host) {
 
     // 任务看板：打开时拉全量账本，并按状态筛。
     React.useEffect(() => {
-      if (!boardOpen) return undefined
+      // 看板和依赖图都要全量账本；只开依赖图时也得拉，否则 allTasks 一直是空的。
+      if (!boardOpen && !graphOpen) return undefined
       let alive = true
       const tick = async () => {
         try {
@@ -5230,7 +5231,7 @@ function createMembersPanel(React, host) {
         alive = false
         clearInterval(timer)
       }
-    }, [boardOpen, revision])
+    }, [boardOpen, graphOpen, revision])
 
     const members = Array.isArray(props?.members)
       ? props.members
