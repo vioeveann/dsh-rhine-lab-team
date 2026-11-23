@@ -10,7 +10,7 @@ import { exportBot, exportPack, importBot, importBotFiles } from './export.js'
 import { appendFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { BUILTIN_BOTS, listRemovedBuiltins, rememberRemovedBuiltin, restoreBuiltinBot } from './builtin-bots.js'
-import { clearBackground, deleteBot, findAvatar, findBackground, loadBots, normalizeBot, renameBot, saveAvatar, saveBackground, saveBot, stripSoulPlaceholder } from './bots.js'
+import { clearBackground, deleteBot, findAvatar, findBackground, loadBots, normalizeBot, renameBot, saveAvatar, saveBackground, saveBot, soulTemplate, stripSoulPlaceholder } from './bots.js'
 import { listSnapshots } from './memory.js'
 import { addActionBot, botsForSession, explicitTeamBots, loadTeams, saveTeams, setSessionTeam } from './teams.js'
 import { createGroup, groupOf, loadGroups, normalizeGroups, removeGroup, renameGroup, saveGroups } from './groups.js'
@@ -683,7 +683,7 @@ export function installTeamMode(ctx, options) {
             }
             await writeFile(
               file,
-              `# ${name} · 灵魂\n\n（在这里写它是谁、守什么规矩。写完保存，下次对话生效。）\n`,
+              soulTemplate(name),
               'utf8',
             )
           }

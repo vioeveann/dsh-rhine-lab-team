@@ -181,11 +181,7 @@ export async function saveBot(root, bot) {
     await readFile(soul, 'utf8')
   } catch {
     const seed = String(incomingPersona ?? bot.persona ?? '').trim()
-    await writeFile(
-      soul,
-      `# ${bot.name} · 灵魂\n\n${seed === '' ? '（在这里写它是谁、守什么规矩）' : seed}\n`,
-      'utf8',
-    )
+    await writeFile(soul, soulTemplate(bot.name ?? bot.id, seed), 'utf8')
   }
   try {
     await readFile(project, 'utf8')
@@ -197,6 +193,28 @@ export async function saveBot(root, bot) {
 
 /** soul 文件的占位句：出现它就算没写过人设。 */
 export const SOUL_PLACEHOLDER = '（在这里写它是谁'
+
+/**
+ * 新建 Bot 的人设模板。晋升感言放在最上面，用户一打开就能看到；
+ * 阶段标签只是提示，晋升时由 speech.js 按段位取值，不会把标签念出来。
+ *
+ * @param name - Bot 名字。
+ * @param body - 人设正文；空着就放占位句。
+ */
+export function soulTemplate(name, body = '') {
+  const text = String(body ?? '').trim()
+  const content = text === '' ? '（在这里写它是谁、守什么规矩。写完保存，下次对话生效。）' : text
+  return [
+    `# ${name} · 灵魂`,
+    '',
+    '晋升感言（用户自行填写，会在晋升时展示）：',
+    '精英化一阶：',
+    '精英化二阶：',
+    '',
+    content,
+    '',
+  ].join('\n')
+}
 
 /**
  * 去掉 soul.txt 里的占位句，剩下的才是真人设。
@@ -274,7 +292,7 @@ export async function migratePersona(root, bot) {
   let soulWritten = false
   if (blank) {
     await mkdir(memoryDir, { recursive: true })
-    await writeFile(soul, `# ${bot.name ?? id} · 灵魂\n\n${persona}\n`, 'utf8')
+    await writeFile(soul, soulTemplate(bot.name ?? id, persona), 'utf8')
     soulWritten = true
   }
   const { persona: _dropped, ...rest } = bot

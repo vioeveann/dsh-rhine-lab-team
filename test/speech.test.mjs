@@ -65,6 +65,51 @@ test('按阶段取：升一阶只抄一阶那句，升二阶只抄二阶那句',
   assert.equal(extractPersonaSpeech(blank, 2), '')
 })
 
+test('短阶段标签：升一阶只抄一阶，升二阶只抄二阶，标签不带进去', () => {
+  const soul = [
+    '# 缪尔赛思 · 灵魂',
+    '',
+    '晋升感言（用户自行填写，会在晋升时展示）：',
+    '精英化一阶：你赠送的礼物，我一定会好好保存的，作为回报，就一起去影院吧。',
+    '精英化二阶：露水会被蒸腾，其中的一切都将消失不见。我还有机会见到天降雨露，重新与同胞聚首相认吗？',
+    '',
+    '一、一句话',
+    '莱茵生命生态科主任。',
+  ].join('\n')
+  assert.equal(
+    extractPersonaSpeech(soul, 1),
+    '你赠送的礼物，我一定会好好保存的，作为回报，就一起去影院吧。',
+  )
+  assert.equal(
+    extractPersonaSpeech(soul, 2),
+    '露水会被蒸腾，其中的一切都将消失不见。我还有机会见到天降雨露，重新与同胞聚首相认吗？',
+  )
+})
+
+test('短阶段标签空着时返回空串，不会把另一阶的感言顶上来', () => {
+  const soul = [
+    '晋升感言（用户自行填写，会在晋升时展示）：',
+    '精英化一阶：',
+    '精英化二阶：二阶才写的话。',
+  ].join('\n')
+  assert.equal(extractPersonaSpeech(soul, 1), '')
+  assert.equal(extractPersonaSpeech(soul, 2), '二阶才写的话。')
+})
+
+test('短标签下面隔空行写的整段感言也能读出来', () => {
+  const soul = [
+    '晋升感言：',
+    '精英化一阶：',
+    '',
+    '第一段。',
+    '第二段。',
+    '',
+    '精英化二阶：二阶的话。',
+  ].join('\n')
+  assert.equal(extractPersonaSpeech(soul, 1), '第一段。\n第二段。')
+  assert.equal(extractPersonaSpeech(soul, 2), '二阶的话。')
+})
+
 test('带说明的抬头不会被当成感言；空模板读出空串', () => {
   const blank = [
     '晋升感言（在下方填写，在晋升时候会体现）：',

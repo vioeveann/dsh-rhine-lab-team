@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { deleteBot, loadBots, normalizeBot, saveBot } from '../host/bots.js'
+import { deleteBot, loadBots, normalizeBot, saveBot, soulTemplate } from '../host/bots.js'
 import { ensureBuiltinBots, listRemovedBuiltins, rememberRemovedBuiltin, restoreBuiltinBot } from '../host/builtin-bots.js'
 
 test('upper case is normalized rather than rejected', () => {
@@ -43,6 +43,29 @@ test('an overlong persona is rejected', () => {
 test('an empty name falls back to the id', () => {
   const result = normalizeBot({ id: 'nova', name: '  ', role: '研究员' })
   assert.equal(result.bot.name, 'nova')
+})
+
+test('新建 BOT 的人设模板带晋升感言占位', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-team-soul-'))
+  try {
+    await saveBot(root, { id: 'nova', name: 'Nova', role: '研究员', persona: '' })
+    const soul = await readFile(join(root, 'bots', 'nova', 'memory', 'soul.txt'), 'utf8')
+    assert.match(soul, /^# Nova · 灵魂\n/)
+    assert.match(soul, /晋升感言（用户自行填写，会在晋升时展示）：\n精英化一阶：\n精英化二阶：\n/)
+    assert.match(soul, /在这里写它是谁/)
+    assert.ok(soul.indexOf('精英化二阶：') < soul.indexOf('在这里写它是谁'), '占位块在人设正文之前')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('soulTemplate 保留传入的人设正文，不覆盖抬头和感言块', () => {
+  const soul = soulTemplate('Nova', '我是 Nova。')
+  assert.match(soul, /^# Nova · 灵魂\n/)
+  assert.match(soul, /精英化一阶：/)
+  assert.match(soul, /我是 Nova。/)
+  assert.ok(soul.endsWith('我是 Nova。\n'))
+  assert.doesNotMatch(soul, /在这里写它是谁/)
 })
 
 test('saving creates the json plus a memory skeleton, and keeps memory on re-save', async () => {

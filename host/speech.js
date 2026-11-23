@@ -33,8 +33,16 @@ export function personaHasSpeech(soul) {
  * @returns 感言原文；人设里没有就返回空串。
  */
 const STAGES = [
-  { rank: 1, label: '普通晋升到精英化一阶', re: /普通\s*晋升到\s*精英化一阶/ },
-  { rank: 2, label: '精英化一阶晋升到精英化二阶', re: /精英化一阶\s*晋升到\s*精英化二阶/ },
+  {
+    rank: 2,
+    label: '精英化二阶',
+    re: /^(?:精英化一阶\s*晋升到\s*)?精英化二阶\s*(?:[：:]|$)/,
+  },
+  {
+    rank: 1,
+    label: '精英化一阶',
+    re: /^(?:普通\s*晋升到\s*)?精英化一阶\s*(?:[：:]|$)/,
+  },
 ]
 
 /**
@@ -67,13 +75,40 @@ function afterColon(line) {
   return match ? match[1].trim() : ''
 }
 
+/** 这一行是不是某一阶段的标签；返回 0/1/2。 */
+function stageOf(line) {
+  const text = String(line ?? '').trim()
+  const hit = STAGES.find((entry) => entry.re.test(text))
+  return hit ? hit.rank : 0
+}
+
+/**
+ * 收集某个阶段标签下面、下一个阶段标签或标题之前的正文。
+ * 空行只是排版，不能把感言截断。
+ */
+function collectStage(lines, start) {
+  const collected = []
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const line = lines[i]
+    const trimmed = line.trim()
+    if (trimmed.startsWith('#')) break
+    if (stageOf(trimmed) > 0) break
+    collected.push(trimmed)
+  }
+  return tidy(collected.join('\n'))
+}
+
 /**
  * 从人设里抠出这一阶的晋升感言原文。
  *
- * 人设里的写法（建议照抄模板）：
+ * 支持两种写法：
  *   晋升感言：
  *   普通晋升到精英化一阶：<这一阶要说的那句>
  *   精英化一阶晋升到精英化二阶：<这一阶要说的那句>
+ *
+ *   晋升感言（用户自行填写，会在晋升时展示）：
+ *   精英化一阶：<这一阶要说的那句>
+ *   精英化二阶：<这一阶要说的那句>
  *
  * 这次升到哪一阶就抄哪一条，标签本身不算内容。只写了一行、没有阶段标注的，
  * 就在任意阶段都用它。没有可用的内容时返回空串，调用方会退回固定文案。
@@ -87,23 +122,20 @@ export function extractPersonaSpeech(soul, toRank = 1) {
   if (head < 0) return ''
 
   const rank = Number(toRank) === 2 ? 2 : 1
-  const stage = STAGES.find((entry) => entry.rank === rank)
 
-  // 先找对应阶段那一行。
-  const stageIndex = lines.findIndex((line) => stage.re.test(line))
-  if (stageIndex >= 0) {
-    const inline = tidy(afterColon(lines[stageIndex]))
+  // 先看全文里有没有阶段标签。有标签就只认标签，避免把另一阶的感言当成通用内容。
+  const stageLines = []
+  for (let i = 0; i < lines.length; i += 1) {
+    const stage = stageOf(lines[i])
+    if (stage > 0) stageLines.push({ index: i, stage })
+  }
+
+  if (stageLines.length > 0) {
+    const target = stageLines.filter((entry) => entry.stage === rank).pop()
+    if (!target) return ''
+    const inline = tidy(afterColon(lines[target.index]))
     if (inline !== '' && !looksLikeHint(inline)) return inline.slice(0, SPEECH_MAX)
-    // 标签后面空着：看下面几行，遇到空行/标题/另一个阶段标签就停。
-    const collected = []
-    for (let i = stageIndex + 1; i < lines.length; i += 1) {
-      const line = lines[i].trim()
-      if (line === '' || line.startsWith('#') || STAGES.some((entry) => entry.re.test(line))) break
-      collected.push(line)
-    }
-    const block = tidy(collected.join(' '))
-    if (block !== '') return block.slice(0, SPEECH_MAX)
-    return ''
+    return collectStage(lines, target.index).slice(0, SPEECH_MAX)
   }
 
   // 没有阶段标注：直接用「晋升感言：」后面的内容（任意阶段通用）。
