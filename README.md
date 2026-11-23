@@ -63,7 +63,7 @@ dsh plugin add https://github.com/vioeveann/dsh-rhine-lab-team
 - **任务依赖**：`dependsOn` 让一件活等上游跑完再开；上游失败/打回，下游直接记 `blocked`，不会 spawn
 - **计划预览** `team_plan`：只出成员、任务单和预估耗时/token，不 spawn、不花 token，确认后再派
 - **交接**：`fromTask` 把上一件的产物复制到新任务目录，一个 Bot 的活直接交给下一个
-- **验收** `team_review`：通过 / 打回（打回必须写理由），可附核对依据 `evidence`；普通交付不强制审计，只有评 excellent 才必须有审计记录；一件活只验收一次，改判走 `team_user_feedback`
+- **验收** `team_review`：通过 / 打回（打回必须写理由），可附核对依据 `evidence`；有交付物的任务默认自动建审计任务，审计 accepted 前不能直接验收（显式 `review: false` 可跳过）；一件活只验收一次，改判走 `team_user_feedback`
 - **中止** `team_cancel`：掐断正在跑的活，账本记成「已取消」，不留 running 残行
 - **任务看板**：面板可看全量账本、按状态筛，能一键清理待验收；任务卡显示耗时、token 和实际模型；单件任务可导出成 Markdown 记录
 - **单聊回传**：直接和 Bot 聊天，那一轮也会记进账本（看板按 chat 筛）

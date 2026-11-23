@@ -387,6 +387,11 @@ export function classifyCheckinReply(text) {
   return 'normal'
 }
 
+/** 监考提醒的回复不是任务结果：它只说明「还在等 / 没卡住」。 */
+function isCheckinReply(text) {
+  return /尚未收到下一步任务|没有新动作|是不是卡住|正常[，,。.\s]*在等/.test(String(text ?? ''))
+}
+
 /**
  * 读最近一段会话，回答「它还在动吗、是不是在原地打转」。
  *
@@ -700,10 +705,12 @@ export function startStallWatch(sessionId, options = {}) {
   let loopWarned = false
   let lastDigestAt = 0
   let ignoreGrowthUntil = 0
+  let nudged = false
   let file = null
   const sendNudge = (text) => {
     if (!nudge) return
     // 提醒会写进子会话；把它自己的写入排除在「有进展」之外。
+    nudged = true
     ignoreGrowthUntil = Date.now() + 5000
     void Promise.resolve(nudge(text)).catch(() => {})
   }
@@ -813,6 +820,9 @@ export function startStallWatch(sessionId, options = {}) {
     promise,
     get cancelledAt() {
       return cancelledAt
+    },
+    get nudged() {
+      return nudged
     },
     stop: () => {
       stopped = true
@@ -1996,6 +2006,26 @@ export function registerTeamTools(ctx, options) {
           })
         }
         let text = result ? blocksToText(result.output) : ''
+        // 监考提醒会触发一轮短回复（「正常，在等 X」）。这不是任务结果：
+        // 收到后催它继续做原任务，再等一轮；避免把状态答复交成 ready。
+        if (stallWatch.nudged && text !== '' && isCheckinReply(text)) {
+          const sid = started.childId ?? childId
+          await debug?.({ event: 'resume-after-nudge', taskId, bytes: text.length })
+          try {
+            await subagents.sendMessage(exec.agent, sid, [{
+              type: 'text',
+              text: '刚才只是状态检查，不是新任务。请继续完成原任务，不要只回状态；完成后给出最终结论。',
+            }], { signal: exec.signal })
+            const resumed = await waitForSessionTurnReply(sid, Date.now(), taskTimeoutMs(), {
+              signal: exec.signal,
+            })
+            if (resumed.why === 'ok' && resumed.text.trim() !== '' && !isCheckinReply(resumed.text)) {
+              text = resumed.text
+            }
+          } catch (error) {
+            await debug?.({ event: 'resume-after-nudge', taskId, ok: false, error: String(error?.message ?? error) })
+          }
+        }
         if (text === '' && cancelledAt) {
           // cancel 会把当前 turn 直接结束，先等它把「断点在哪」写回来，别交一张空卡。
           const sid = started.childId ?? childId
@@ -2149,6 +2179,7 @@ export function registerTeamTools(ctx, options) {
       sessionId,
       model: entry.model ?? '',
       review: entry.review === true,
+      reviewOf: entry.reviewOf ?? null,
       continuesFrom: entry.taskId,
       brief,
     })
@@ -2302,6 +2333,7 @@ export function registerTeamTools(ctx, options) {
         dependsOnMode: entry.dependsOnMode,
         chainId: entry.chainId,
         review: entry.review === true,
+        __reviewOf: entry.reviewOf ?? undefined,
         retryNote: note,
       },
       exec,
