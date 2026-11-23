@@ -1384,7 +1384,7 @@ function createMembersPanel(React, host) {
       if (count > previous) shake()
       if (count !== previous) setPrevious(count)
     }, [count, node, previous])
-    const color = unread ? '#B44836' : '#8C9187'
+    const color = unread ? '#E77547' : '#B7BB60'
     return h(
       'button',
       {
@@ -1409,7 +1409,7 @@ function createMembersPanel(React, host) {
           alignItems: 'center',
           justifyContent: 'center',
           cursor: 'pointer',
-          opacity: unread ? 1 : 0.45,
+          opacity: unread ? 1 : 0.9,
           color,
           transformOrigin: '50% 50%',
         },
@@ -1423,15 +1423,14 @@ function createMembersPanel(React, host) {
           width: 12.6,
           height: 9.6,
           rx: 1.4,
-          fill: 'none',
-          stroke: 'currentColor',
-          strokeWidth: 1.4,
+          fill: 'currentColor',
+          stroke: 'none',
         }),
         h('path', {
           d: 'M1.4 2.2 L7 6.3 L12.6 2.2',
           fill: 'none',
-          stroke: 'currentColor',
-          strokeWidth: 1.4,
+          stroke: '#FFFDF7',
+          strokeWidth: 1.3,
           strokeLinecap: 'round',
           strokeLinejoin: 'round',
         }),
@@ -1530,7 +1529,7 @@ function createMembersPanel(React, host) {
           { style: { display: 'flex', alignItems: 'center', gap: 8 } },
           h(MailEnvelope, { count: data.unread, onClick: () => {} }),
           h('strong', { style: { fontSize: 14 } }, `${bot?.name ?? bot?.id} 的信箱`),
-          data.unread > 0 ? h('span', { style: { fontSize: 11, color: '#B44836' } }, `${data.unread} 条未读`) : null,
+          data.unread > 0 ? h('span', { style: { fontSize: 11, color: '#C45A2E' } }, `${data.unread} 条未读`) : null,
           h('button', {
             type: 'button',
             onClick: onClose,
