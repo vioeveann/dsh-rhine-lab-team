@@ -5421,26 +5421,6 @@ function createMembersPanel(React, host) {
       }
     }, [sessionForRoster, revision])
 
-    // 成本统计：每个 Bot 干了多少件、回了多少字。
-    React.useEffect(() => {
-      let alive = true
-      const tick = async () => {
-        try {
-          const response = await fetch('/dsh-team/stats')
-          const data = await response.json()
-          if (alive && Array.isArray(data?.bots)) setStats(data.bots)
-        } catch {
-          // 统计失败不影响主列表。
-        }
-      }
-      void tick()
-      const timer = setInterval(tick, 10_000)
-      return () => {
-        alive = false
-        clearInterval(timer)
-      }
-    }, [])
-
     // Recent tasks: the books behind the cards.
     React.useEffect(() => {
       let alive = true
@@ -5500,7 +5480,6 @@ function createMembersPanel(React, host) {
     /** 「另一个实例也在用这个目录」只提示一次。 */
     const conflictNoticed = React.useRef?.(false) ?? { current: false }
     const [detail, setDetail] = React.useState(null)
-    const [stats, setStats] = React.useState([])
     const [retrying, setRetrying] = React.useState(false)
 
     /**
@@ -6587,28 +6566,6 @@ function createMembersPanel(React, host) {
             key: 'notice',
             style: { flex: '0 0 auto', fontSize: 11, color: p.warn, lineHeight: 1.4 },
           }, notice)
-        : null,
-      stats.length > 0
-        ? h(
-            'div',
-            {
-              style: {
-                flex: '0 0 auto',
-                display: 'flex',
-                flexWrap: 'wrap',
-                gap: 8,
-                fontSize: 10,
-                color: p.faint,
-                borderTop: `1px solid ${p.line}`,
-                paddingTop: 6,
-              },
-            },
-            stats.slice(0, 4).map((row) => h(
-              'span',
-              { key: row.bot },
-              `${row.bot} ${row.tasks} 件${row.tokens ? ` · ${formatTokens(row.tokens)} tok` : ''}`,
-            )),
-          )
         : null,
       taskSection,
       confirmDialog,
