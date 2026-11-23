@@ -2716,7 +2716,7 @@ export function registerTeamTools(ctx, options) {
       const dir = join(root, '.team-work', bot.id, `chat-${Date.now().toString(36)}`)
       await mkdir(dir, { recursive: true })
       pending.set(childId, { bot, taskDir: dir })
-      const prompt = `${address()}主动打开这个会话想和你说话，不是派任务：不要调用任何工具，不要写文件，也不要给自己派活。只回一句「在」，然后等${address()}开口。`
+      const prompt = `主动打开这个会话想和你说话，不是派任务：不要调用任何工具，不要写文件，也不要给自己派活。只回一句「在」，然后等${address()}开口。`
       const base = {
         provider: 'spawn',
         label: `单聊 ${bot.name ?? bot.id}`,
