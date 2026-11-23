@@ -1667,6 +1667,7 @@ function createMembersPanel(React, host) {
             'span',
             {
               style: {
+                flex: '0 0 auto',
                 fontWeight: nameFontWeight,
                 fontSize: 13,
                 letterSpacing: aurora ? '0.04em' : undefined,
@@ -1716,6 +1717,8 @@ function createMembersPanel(React, host) {
             'span',
             {
               style: {
+                flex: '1 1 auto',
+                minWidth: 0,
                 fontSize: 11,
                 color: dimColor,
                 whiteSpace: 'nowrap',
@@ -6399,7 +6402,7 @@ function createMembersPanel(React, host) {
                 },
                 h(
                   'div',
-                  { style: { display: 'flex', gap: 6, alignItems: 'baseline' } },
+                  { style: { display: 'flex', flexWrap: 'wrap', gap: '2px 6px', alignItems: 'baseline', minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden' } },
                   h('span', {
                     style: {
                       flex: '0 0 auto',
