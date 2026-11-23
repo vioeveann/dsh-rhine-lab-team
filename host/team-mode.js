@@ -10,7 +10,7 @@ import { exportBot, exportPack, importBot, importBotFiles } from './export.js'
 import { appendFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { BUILTIN_BOTS, listRemovedBuiltins, rememberRemovedBuiltin, restoreBuiltinBot } from './builtin-bots.js'
-import { clearBackground, deleteBot, findAvatar, findBackground, loadBots, normalizeBot, renameBot, saveAvatar, saveBackground, saveBot, SOUL_PLACEHOLDER } from './bots.js'
+import { clearBackground, deleteBot, findAvatar, findBackground, loadBots, normalizeBot, renameBot, saveAvatar, saveBackground, saveBot, stripSoulPlaceholder } from './bots.js'
 import { listSnapshots } from './memory.js'
 import { addActionBot, botsForSession, explicitTeamBots, loadTeams, saveTeams, setSessionTeam } from './teams.js'
 import { createGroup, groupOf, loadGroups, normalizeGroups, removeGroup, renameGroup, saveGroups } from './groups.js'
@@ -592,6 +592,24 @@ export function installTeamMode(ctx, options) {
         }
         const file = join(root, 'bots', bot, 'memory', 'soul.txt')
         if (req.method === 'POST') {
+          // 先确保文件在：不存在就建一份带抬头和占位句的，用户在编辑器里接着写。
+          try {
+            await readFile(file, 'utf8')
+          } catch {
+            await mkdir(join(root, 'bots', bot, 'memory'), { recursive: true })
+            let name = bot
+            try {
+              const record = JSON.parse(await readFile(join(root, 'bots', `${bot}.json`), 'utf8'))
+              if (typeof record.name === 'string' && record.name.trim() !== '') name = record.name.trim()
+            } catch {
+              // 读不到就用 id
+            }
+            await writeFile(
+              file,
+              `# ${name} · 灵魂\n\n（在这里写它是谁、守什么规矩。写完保存，下次对话生效。）\n`,
+              'utf8',
+            )
+          }
           // 用系统默认程序打开；打不开就把路径回给面板，让它自己提示。
           try {
             await openInEditor(file)
@@ -601,15 +619,15 @@ export function installTeamMode(ctx, options) {
           }
           return
         }
-        let text = ''
+        let raw = ''
         try {
-          text = await readFile(file, 'utf8')
+          raw = await readFile(file, 'utf8')
         } catch {
-          text = ''
+          raw = ''
         }
-        // 只有占位句等于没写：面板那边当空处理，提示去写。
-        const blank = text.trim() === '' || text.includes(SOUL_PLACEHOLDER)
-        json(res, 200, { ok: true, bot, path: file, exists: !blank, text: blank ? '' : text })
+        // 预览给的就是真正会注入的那份：占位句已经剔掉，面板和 Bot 看到的是同一段。
+        const text = stripSoulPlaceholder(raw)
+        json(res, 200, { ok: true, bot, path: file, exists: text !== '', text })
       } catch (error) {
         json(res, 500, { ok: false, error: String(error?.message ?? error) })
       }

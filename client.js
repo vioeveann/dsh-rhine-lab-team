@@ -2766,7 +2766,7 @@ function createMembersPanel(React, host) {
         })
         const data = await response.json()
         if (data?.ok) {
-          setPersona((current) => ({ ...current, path: data.path ?? current.path, note: "已在外部编辑器打开，改完点「重新读取」" }))
+          setPersona((current) => ({ ...current, path: data.path ?? current.path, note: "已在外部编辑器打开，改完保存，切回来会自动重读" }))
           return
         }
         setPersona((current) => ({
@@ -2778,6 +2778,21 @@ function createMembersPanel(React, host) {
         setPersona((current) => ({ ...current, note: `打开失败：${error?.message ?? error}` }))
       }
     }
+
+    // 人设只在 txt 里改：面板打开时读一次；窗口重新拿到焦点（用户从记事本切回来）再读一次。
+    // 所以「重新读取」不必做成按钮，切回来自己就刷新。
+    React.useEffect(() => {
+      const reload = () => {
+        if (document.visibilityState === "hidden") return
+        void loadPersona()
+      }
+      window.addEventListener("focus", reload)
+      document.addEventListener("visibilitychange", reload)
+      return () => {
+        window.removeEventListener("focus", reload)
+        document.removeEventListener("visibilitychange", reload)
+      }
+    }, [member.id])
 
     React.useEffect(() => {
       let alive = true
@@ -3422,18 +3437,6 @@ function createMembersPanel(React, host) {
               cursor: "pointer",
             },
           }, "编辑人设"),
-          h("button", {
-            type: "button",
-            onClick: () => void loadPersona(member.id),
-            style: {
-              padding: "3px 8px",
-              fontSize: 10,
-              color: RECRUIT_LIGHT.accent,
-              background: "transparent",
-              border: `1px solid ${RECRUIT_LIGHT.accent}`,
-              cursor: "pointer",
-            },
-          }, "重新读取"),
           persona.note ? h("span", { style: { fontSize: 10, color: RECRUIT_LIGHT.muted } }, persona.note) : null,
         ),
       ),
@@ -3519,13 +3522,15 @@ function createMembersPanel(React, host) {
       id: "",
       name: "",
       role: "",
-      persona: "",
       model: "",
       allow: "",
       deny: "",
       note: "",
       stars: 0,
     })
+    /** 还没建 Bot 就点「编辑人设」：在按钮右边提示一句，几秒后自己消失。 */
+    const [personaHint, setPersonaHint] = React.useState("")
+    const personaHintTimer = React.useRef(null)
     const [modelGroups, setModelGroups] = React.useState([])
     const [note, setNote] = React.useState("")
     const [busy, setBusy] = React.useState(false)
@@ -3561,7 +3566,6 @@ function createMembersPanel(React, host) {
           id: form.id,
           name: form.name,
           role: form.role,
-          persona: form.persona,
           ...(form.model === "" ? {} : { model: form.model }),
           ...(form.note.trim() === "" ? {} : { note: form.note.trim() }),
           ...(form.stars > 0 ? { stars: form.stars } : {}),
@@ -3706,7 +3710,33 @@ function createMembersPanel(React, host) {
       field("备注（显示在职责后面，可写文字或符号）", "note", { placeholder: "例如 主审 · 图纸" }),
       field("能力卡 · 只给这些工具（逗号分隔，留空=不限制）", "allow", { placeholder: "例如 read, grep, bash" }),
       field("能力卡 · 禁用这些工具（逗号分隔）", "deny"),
-      field("人设（会写成它的 memory/soul.txt，之后在文件里改）", "persona", { multiline: true }),
+      // 人设只剩 memory/soul.txt 一份：招募时不写，建好之后去成员设置里「编辑人设」打开文件自己写。
+      h(
+        "div",
+        { style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", minHeight: 22 } },
+        h("button", {
+          type: "button",
+          onClick: () => {
+            setPersonaHint("请在创建BOT后再进行人设编辑")
+            if (personaHintTimer.current) clearTimeout(personaHintTimer.current)
+            personaHintTimer.current = setTimeout(() => setPersonaHint(""), 4000)
+          },
+          style: {
+            padding: "3px 10px",
+            fontSize: 10,
+            fontWeight: 700,
+            color: RECRUIT_LIGHT.onAccent,
+            background: RECRUIT_LIGHT.accent,
+            border: `1px solid ${RECRUIT_LIGHT.accent}`,
+            cursor: "pointer",
+          },
+        }, "编辑人设"),
+        h(
+          "span",
+          { style: { fontSize: 10, color: personaHint ? RECRUIT_LIGHT.accent : RECRUIT_LIGHT.muted } },
+          personaHint || "人设只写在 txt 里，建好后从成员设置进入",
+        ),
+      ),
       avatarFile
         ? h(AvatarCropper, {
             file: avatarFile,

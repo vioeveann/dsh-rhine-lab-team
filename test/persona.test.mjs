@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { adoptSoulFile, migratePersona, saveBot } from '../host/bots.js'
+import { adoptSoulFile, migratePersona, saveBot, stripSoulPlaceholder } from '../host/bots.js'
 import { installChildDecoration } from '../host/tools.js'
 
 async function emptyRoot() {
@@ -106,4 +106,13 @@ test('装饰子会话时只注入 soul.txt，不再读 JSON 里的 persona', asy
   assert.ok(persona, '没注入人设段')
   assert.match(persona.text, /文件里的人设/)
   assert.doesNotMatch(persona.text, /JSON 里的旧人设/)
+})
+
+test('占位句下面接着写的人设不会被丢掉：只丢占位那一行和抬头', async () => {
+  const fresh = '# Nova · 灵魂\n\n（在这里写它是谁、守什么规矩。写完保存，下次对话生效。）\n'
+  // 只有抬头 + 占位句 = 还没写人设。
+  assert.equal(stripSoulPlaceholder(fresh), '')
+  // 用户在占位句下面接着写：整份人设要留下来，只去掉抬头和占位句。
+  const written = `${fresh}\n## 她是谁\n\n我是 Nova，只做核对。\n`
+  assert.equal(stripSoulPlaceholder(written), '## 她是谁\n\n我是 Nova，只做核对。')
 })

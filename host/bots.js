@@ -199,6 +199,23 @@ export async function saveBot(root, bot) {
 export const SOUL_PLACEHOLDER = '（在这里写它是谁'
 
 /**
+ * 去掉 soul.txt 里的占位句，剩下的才是真人设。
+ *
+ * 以前是「整个文件只要含占位句就当没写」，用户在占位句下面接着写，
+ * 整份人设就被静默丢掉了。现在只丢那一行。
+ *
+ * @param text - soul.txt 全文。
+ * @returns 去掉占位行、去掉首尾空白后的人设正文。
+ */
+export function stripSoulPlaceholder(text) {
+  if (typeof text !== 'string' || text === '') return ''
+  const lines = text.split(/\r?\n/).filter((line) => !line.includes(SOUL_PLACEHOLDER))
+  // 开头那句「# 名字 · 灵魂」是插件自己写的抬头，也不算人设。
+  if (lines.length > 0 && /^#\s*.*·\s*灵魂\s*$/.test(lines[0].trim())) lines.shift()
+  return lines.join('\n').replace(/^\s*\n+/, '').trim()
+}
+
+/**
  * 人设文件早先叫 `soul.md`，现在统一成 `soul.txt`（哪台电脑都能双击打开）。
  * 已经有 `soul.txt` 就不动；否则把 `.md` 改名过来。
  *

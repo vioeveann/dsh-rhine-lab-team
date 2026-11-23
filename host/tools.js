@@ -32,7 +32,7 @@ import { commitMemory, listSnapshots, restoreSnapshot } from './memory.js'
 import { confirmImprovement, promoteBot, savePromotionSpeech, updateGrowth } from './growth-store.js'
 import { growthDetail, growthSummary, promote, regrade, settleRepeat, settleTask, settleTeaching } from './growth.js'
 import { taskGain } from './progress.js'
-import { loadBots } from './bots.js'
+import { loadBots, stripSoulPlaceholder } from './bots.js'
 
 /** 插件自带审计员的 id；打 excellent 前必须先有它的审计记录。 */
 const AUDITOR_ID = 'auditor'
@@ -2991,8 +2991,8 @@ export function installChildDecoration(ctx, options) {
     try {
       const team = await readTeamMemory(root)
       const rawSoul = await readMemory(root, hit.bot.id, 'soul.txt')
-      // 新建时写进去的占位句子，不能当成它的人设。
-      const soul = rawSoul.includes('（在这里写它是谁') ? '' : rawSoul
+      // 占位句只丢那一行：用户是在占位句下面接着写人设的，不能整份丢掉。
+      const soul = stripSoulPlaceholder(rawSoul)
       // 底座单独一段、排在人设前面：用户改 soul / persona 只会换掉人设，
       // 换不掉这一段。
       agent.ctx.systemPrompt.section({
