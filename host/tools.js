@@ -47,6 +47,39 @@ const AUDITOR_ID = 'auditor'
 const liveChildren = new Map()
 
 /**
+ * 刚建出来、人设还没挂上的私聊会话。
+ *
+ * 私聊是独立的根会话：`sessionController.create()` 一返回，会话就已经能被
+ * 发消息了，但装饰（人设段、私聊规则、工具收敛）是在 `agent/created` 里
+ * 异步做的。第一句话必须等它挂完，否则她第一轮回答看不见自己的人设。
+ */
+const privateOpenings = new Map()
+
+/**
+ * 等某个私聊会话装饰完。
+ * @param sessionId - 会话 id。
+ */
+function expectPrivateDecoration(sessionId) {
+  let settle = () => {}
+  const promise = new Promise((done) => {
+    settle = () => done(true)
+  })
+  privateOpenings.set(sessionId, { promise, settle })
+  return promise
+}
+
+/**
+ * 装饰完了（成功或失败都算），放行等在第一句话那里的调用。
+ * @param sessionId - 会话 id。
+ */
+function settlePrivateDecoration(sessionId) {
+  const record = privateOpenings.get(String(sessionId ?? ''))
+  if (!record) return
+  privateOpenings.delete(String(sessionId ?? ''))
+  record.settle()
+}
+
+/**
  * 审计单的固定口径：只读、只核受影响处、输出一页。
  * 上一版的审计会重读全文、重抓数据，四次审计吃掉 59% 的墙钟。
  */
@@ -58,11 +91,40 @@ const AUDIT_BRIEF = `
 - 输出一页以内：结论（通过 / 不通过）+ 问题清单（位置、问题、依据、改法）；没有必须改就写「无必须改」。
 - 必查五条：①交付物存在、非空、数量与任务单一致（缺了直接不通过）；②数字与原文一致；③出处能落到材料的具体节或行；④口径有来源，不许把自定口径说成官方口径；⑤无法确认的写「不确定」。`
 import { DEFAULT_SPEECH, extractPersonaSpeech } from './speech.js'
-import { BASE_RULES, BASE_RULES_ORDER, BASE_RULES_SECTION, SCOPE_ORDER, SCOPE_RULES, SCOPE_SECTION } from './base-rules.js'
+import {
+  BASE_RULES,
+  BASE_RULES_ORDER,
+  BASE_RULES_SECTION,
+  PRIVATE_ORDER,
+  PRIVATE_RULES,
+  PRIVATE_SECTION,
+  SCOPE_ORDER,
+  SCOPE_RULES,
+  SCOPE_SECTION,
+} from './base-rules.js'
+import {
+  addPrivateUnread,
+  clearPrivateUnread,
+  privateBotOfSession,
+  privateEntryOf,
+  privateStatePath,
+  readPrivateState,
+  setPrivateEntry,
+  writePrivateState,
+} from './private-chat.js'
 import { usageOfFrame } from './usage.js'
 
 /** Prompt section name used for a bot persona. */
 const PERSONA_SECTION = 'dsh-team/persona'
+/** 人设段的排序值。 */
+const PERSONA_ORDER = 120
+/**
+ * 每个 Bot 当前的人设段全文，按 bot id 存。
+ *
+ * 人设段注册时 `text` 给的是取值函数，每次组装系统提示现取这一份——
+ * 所以热更新只要改这里，开着的会话下一轮就跟上，不必重挂 prompt 段。
+ */
+const personaTexts = new Map()
 /** 写感言最多等这么久；它只是一句话的话，不值得按任务超时算。 */
 const SPEECH_TIMEOUT_MS = 120_000
 
@@ -1091,6 +1153,25 @@ export const DEFAULT_DENY = [
   // Bot 不能把问题弹回给你：要拍板就结束本轮，由秘书转述。
   'ask_user_question',
   'request_user_input',
+  // 团队协作只属于主会话：Bot 的私聊 / 工作聊天里开着就是无限套娃。
+  // 记忆那几个（team_memory_*、team_recall）留着，Bot 还得记自己的教训。
+  'team_dispatch',
+  'team_dispatch_many',
+  'team_plan',
+  'team_assign',
+  'team_health',
+  'team_collect',
+  'team_review',
+  'team_retry',
+  'team_cancel',
+  'team_resume',
+  'team_promote',
+  'team_teach',
+  'team_improve',
+  'team_user_feedback',
+  'team_send',
+  'team_inbox',
+  'team_reply',
 ]
 
 /**
@@ -1236,6 +1317,9 @@ export function canStartTask(tasks, sessionId, limit, options = {}) {
  */
 export function registerTeamTools(ctx, options) {
   const { root, tools, agents, subagents, debug, pending, tasks, mailbox, isTeamSession, persistTasks, usageBook } = options
+  // 人设段的撤换句柄：改完人设要让「已经开着的会话」下一轮就吃到新设定，
+  // 就得知道该撤哪一段。key 是会话 id，值里带 Bot id 和三个 off。
+  const personas = options.personas instanceof Map ? options.personas : new Map()
 
   /**
    * 怎么称呼用户：设置里的 address，默认「你」。
@@ -4045,6 +4129,168 @@ export function registerTeamTools(ctx, options) {
       speech: false,
     })
 
+    /**
+     * 这个 Bot 在当前主会话里已经开过的那条工作聊天。
+     *
+     * 工作聊天按主会话隔离（A 会话一条、B 会话另一条）；同一个会话里点两次卡片
+     * 不该开出两条，所以新建之前先找一遍。
+     * @param botId - Bot id。
+     * @param parentSession - 当前主会话 id。
+     */
+    const workChatOf = (botId, parentSession, privateSessionId = '') => {
+      let found = null
+      for (const row of tasks?.values?.() ?? []) {
+        if (row.bot !== botId) continue
+        if (row.chatKind === 'private') continue
+        // 老账本里的私聊轮次没有 chatKind，靠 sessionId 再挡一次，
+        // 否则点击卡片会把活儿送进私聊。
+        if (privateSessionId && row.sessionId === privateSessionId) continue
+        if (!row.sessionId) continue
+        if (String(row.parentSession ?? '') !== String(parentSession ?? '')) continue
+        if (!found || (row.startedAt ?? 0) > (found.startedAt ?? 0)) found = row
+      }
+      return found
+    }
+
+    /**
+     * 起一条聊天子会话（工作聊天 / 私聊共用）。只负责把会话点起来，
+     * 账本和私聊状态由调用方各自记。
+     * @param options - `{ bot, parentAgent, parent, prompt, kind }`。
+     */
+    const spawnChatChild = async ({ bot, parentAgent, parent, prompt, kind }) => {
+      const childId = `session-${randomUUID()}`
+      const dir = join(root, '.team-work', bot.id, `chat-${Date.now().toString(36)}`)
+      await mkdir(dir, { recursive: true })
+      pending.set(childId, { bot, taskDir: dir, chatKind: kind })
+      // DSH 的硬约束：往子会话发消息时它的根会话必须活着。记下创建时的根，
+      // 以后判断这条会话还能不能发消息就看它。
+      let rootSession = parent
+      try {
+        const rootAgent = subagents?.rootOf?.(parentAgent)
+        rootSession = String(rootAgent?.session?.header?.id ?? rootAgent?.id ?? parent)
+      } catch {
+        rootSession = parent
+      }
+      const base = {
+        provider: 'spawn',
+        label: kind === 'private' ? `私聊 ${bot.name ?? bot.id}` : `单聊 ${bot.name ?? bot.id}`,
+        // 名字必须唯一，否则同名子会话会被拒。
+        name: `${bot.id}-${kind === 'private' ? 'pm' : 'chat'}-${Date.now().toString(36)}`.slice(0, 40),
+        childId,
+        cwd: dir,
+        prompt: [{ type: 'text', text: prompt }],
+        parent: parentAgent,
+        signal: new AbortController().signal,
+        delivery: 'caller',
+      }
+      try {
+        const started = typeof bot.model === 'string' && bot.model !== ''
+          ? await subagents.startActivation({ ...base, agentOptions: { model: bot.model } }).catch(() => subagents.startActivation(base))
+          : await subagents.startActivation(base)
+        // 不等它说完：会话一建好就把 id 交给面板去打开。
+        Promise.resolve(started?.result).catch(() => {})
+        return { ok: true, childId, dir, rootSession }
+      } catch (error) {
+        pending.delete(childId)
+        return { ok: false, error: String(error?.message ?? error) }
+      }
+    }
+
+    /**
+     * 记一条「会话入口」账本行：工作聊天和私聊都记，用 chatKind 分开。
+     * doneAt 立刻写上——这是入口标记，不是在跑的活，免得名册一直显示忙。
+     */
+    const recordChatEntry = ({ bot, parent, rootSession, dir, childId, kind }) => {
+      const chatId = `c-open-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 4)}`
+      tasks.set(chatId, {
+        taskId: chatId,
+        bot: bot.id,
+        parentSession: parent,
+        rootSession,
+        cwd: dir,
+        startedAt: Date.now(),
+        doneAt: Date.now(),
+        status: 'chat',
+        sessionId: childId,
+        chatKind: kind,
+        note: kind === 'private' ? '私聊入口' : '单聊入口',
+      })
+      void persistTasks?.()
+      options.api?.broadcast?.({ type: 'tasks' })
+      return chatId
+    }
+
+    /**
+     * 取一个宿主服务；没有就返回 undefined（不同版本装的插件不一样）。
+     * @param name - 服务名。
+     */
+    const service = (name) => {
+      try {
+        if (typeof ctx?.get === 'function') {
+          const found = ctx.get(name)
+          if (found !== undefined) return found
+        }
+      } catch {
+        // 落到属性访问
+      }
+      try {
+        return ctx?.[name]
+      } catch {
+        return undefined
+      }
+    }
+
+    /**
+     * 把新会话挂进它所在目录的工作区。
+     *
+     * `sessionController.create({ cwd })` 只把目录写进会话头，不会挂工作区；
+     * 不挂的话这条私聊只在磁盘上，左侧会话列表里看不到。
+     * @param sessionId - 会话 id。
+     * @param cwd - 会话所在目录。
+     */
+    // 用户把私聊归档，意思就是「这条我收起来了」。再点头像时不把它拽回来：
+    // 归档的会话客户端也不让直接开（点进去会落到空白页）。所以按「新开一条」处理，
+    // 旧的留在归档里，随时能自己取消归档找回来。
+    const isArchived = (sessionId) => {
+      const registry = service('workspaceRegistry')
+      const archived = Array.isArray(registry?.archivedSessionIds) ? registry.archivedSessionIds : []
+      return archived.includes(sessionId)
+    }
+
+    const attachWorkspace = async (sessionId, cwd) => {
+      try {
+        const registry = service('workspaceRegistry')
+        if (typeof registry?.resolveByPath !== 'function' || String(cwd ?? '') === '') return false
+        let workspace = await registry.resolveByPath(cwd)
+        if (workspace === undefined && typeof registry?.create === 'function') {
+          // 新目录要先登记成工作区，否则会话没处挂、左侧列表里也看不到它。
+          try {
+            await mkdir(cwd, { recursive: true })
+          } catch {}
+          workspace = await registry.create(cwd)
+          if (typeof workspace?.setTitle === 'function') {
+            await workspace.setTitle('私聊会话').catch(() => {})
+          }
+          await debug?.({ event: 'private-workspace-create', cwd, ok: true })
+        }
+        // 老用户那份工作区名可能是旧标题，顺手统一。
+        if (workspace !== undefined && typeof workspace?.setTitle === 'function') {
+          await workspace.setTitle('私聊会话').catch(() => {})
+        }
+        if (typeof workspace?.attachSession !== 'function') return false
+        await workspace.attachSession(sessionId)
+        // 私聊工作区排在最后：它是 Bot 的地方，不该挤在用户的工程目录中间。
+        // registry.insertBefore(id) 不带锚点就是挪到末尾。
+        if (workspace?.id !== undefined && typeof registry?.insertBefore === 'function') {
+          await registry.insertBefore(workspace.id).catch(() => {})
+        }
+        return true
+      } catch (error) {
+        await debug?.({ event: 'private-workspace', ok: false, error: String(error?.message ?? error) })
+        return false
+      }
+    }
+
     options.api.openChat = async ({ botId, parentSession, chatSessionId }) => {
       const bot = await readBot(root, String(botId ?? '').trim())
       if (!bot) return { ok: false, error: '没有这个 Bot' }
@@ -4086,65 +4332,365 @@ export function registerTeamTools(ctx, options) {
         }
       }
 
-      const childId = `session-${randomUUID()}`
-      const dir = join(root, '.team-work', bot.id, `chat-${Date.now().toString(36)}`)
-      await mkdir(dir, { recursive: true })
-      pending.set(childId, { bot, taskDir: dir })
-      // 记下创建时所在的根会话：以后判断这条单聊还能不能发消息，就看它。
-      // 拿不到 rootOf 就退回当前会话；当前会话本身一定是活的。
-      let rootSession = parent
+      // 当前主会话里已经有一条工作聊天：直接复用，别点两次卡片开出两条。
+      let privateSessionId = ''
       try {
-        const rootAgent = subagents?.rootOf?.(parentAgent)
-        rootSession = String(rootAgent?.session?.header?.id ?? rootAgent?.id ?? parent)
+        privateSessionId = privateEntryOf(await readPrivateState(root), bot.id)?.sessionId ?? ''
       } catch {
-        rootSession = parent
+        privateSessionId = ''
       }
+      const existing = workChatOf(bot.id, parent, privateSessionId)
+      if (existing && chatRootAlive(existing, { currentSession: parent, getAgent: (id) => agents?.get?.(id) })) {
+        return {
+          ok: true,
+          sessionId: existing.sessionId,
+          parentSessionId: String(existing.parentSession ?? parent),
+          identity: chatIdentityOf(bot),
+          bot: bot.id,
+          reused: true,
+        }
+      }
+
       const prompt = `主动打开这个会话想和你说话，不是派任务：不要调用任何工具，不要写文件，也不要给自己派活。只回一句「在」，然后等${address()}开口。`
-      const base = {
-        provider: 'spawn',
-        label: `单聊 ${bot.name ?? bot.id}`,
-        // 名字必须唯一，否则同名子会话会被拒。
-        name: `${bot.id}-chat-${Date.now().toString(36)}`.slice(0, 40),
-        childId,
-        cwd: dir,
-        prompt: [{ type: 'text', text: prompt }],
-        parent: parentAgent,
-        signal: new AbortController().signal,
-        delivery: 'caller',
+      const spawned = await spawnChatChild({ bot, parentAgent, parent, prompt, kind: 'work' })
+      if (!spawned.ok) return spawned
+      recordChatEntry({
+        bot,
+        parent,
+        rootSession: spawned.rootSession,
+        dir: spawned.dir,
+        childId: spawned.childId,
+        kind: 'work',
+      })
+      await debug?.({ event: 'chat-open', bot: bot.id, sessionId: spawned.childId, rootSession: spawned.rootSession })
+      // 父会话 id 一起回去：面板拿到就能直接开出「子会话」标签，
+      // 不用等名册刷新（等那一下，用户第一次点必然失败）。
+      // identity 也一起回去：面板拿它先写进头像映射，第一帧就不会顶着主会话的头像。
+      // 字段跟 `/dsh-team/identity-map` 那份保持一致，改的时候两边一起改。
+      return { ok: true, sessionId: spawned.childId, parentSessionId: parent, identity: chatIdentityOf(bot), bot: bot.id }
+    }
+
+    /**
+     * 私聊：一个 Bot 固定一条，跨主会话复用，永远不因为换了主会话而新开。
+     *
+     * 0.7 起私聊是**独立的根会话**，不再是主会话的子代理。子代理有空闲后
+     * 被叫醒再要一轮的需求，冷恢复时 delivery 会退回 'parent'，于是她的收尾
+     * 会变成一条「Background subagent … finished」通知注入主会话——用户
+     * 私聊说了什么，秘书那边看得见。根会话没有父级，这条通路根本不存在。
+     *
+     * 不按「根会话还活着没有」判复用：判了就会在换了 newchat 之后悄悄开一条
+     * 新的，用户要的是历史还在同一条里。
+     * @param options - `{ botId, parentSession, reopen }`；reopen 会新开一条并把
+     *   旧的记成已归档（会话本身不动）。
+     */
+    /**
+     * 这个会话是不是 Bot 的私聊 / 工作聊天。客户端用它决定要不要藏「团队协作」
+     * 开关——团队协作只在主会话里有意义，Bot 的会话里开着就是套娃。
+     * @returns `'private'` | `'work'` | `''`（普通会话）
+     */
+    options.api.botChatOf = async (sessionId) => {
+      const sid = String(sessionId ?? '').trim()
+      if (sid === '') return ''
+      for (const row of tasks.values()) {
+        if (row?.sessionId !== sid || row.status !== 'chat') continue
+        return row.chatKind === 'private' ? 'private' : 'work'
       }
       try {
-        const started = typeof bot.model === 'string' && bot.model !== ''
-          ? await subagents.startActivation({ ...base, agentOptions: { model: bot.model } }).catch(() => subagents.startActivation(base))
-          : await subagents.startActivation(base)
-        // 不等它说完：会话一建好就把 id 交给面板去打开。
-        Promise.resolve(started?.result).catch(() => {})
-        // 记一条「单聊」，下次点卡片直接复用这个会话。
-        const chatId = `c-open-${Date.now().toString(36)}`
-        tasks.set(chatId, {
-          taskId: chatId,
-          bot: bot.id,
-          parentSession: parent,
-          rootSession,
-          cwd: dir,
-          startedAt: Date.now(),
-          // 这是「入口标记」，不是在跑的活：立刻收尾，免得名册一直显示忙。
-          doneAt: Date.now(),
-          status: 'chat',
-          sessionId: childId,
-          note: '单聊入口',
-        })
-        void persistTasks?.()
-        options.api?.broadcast?.({ type: 'tasks' })
-        await debug?.({ event: 'chat-open', bot: bot.id, sessionId: childId, rootSession })
-        // 父会话 id 一起回去：面板拿到就能直接开出「子会话」标签，
-        // 不用等名册刷新（等那一下，用户第一次点必然失败）。
-        // identity 也一起回去：面板拿它先写进头像映射，第一帧就不会顶着主会话的头像。
-        // 字段跟 `/dsh-team/identity-map` 那份保持一致，改的时候两边一起改。
-        return { ok: true, sessionId: childId, parentSessionId: parent, identity: chatIdentityOf(bot), bot: bot.id }
+        const state = await readPrivateState(root)
+        for (const entry of Object.values(state.bots ?? {})) {
+          if (entry?.sessionId === sid) return 'private'
+        }
+      } catch {
+        // 私聊记录坏了就当普通会话：藏开关是小，报错是大。
+      }
+      return ''
+    }
+
+    options.api.openPrivate = async ({ botId, parentSession, reopen }) => {
+      const wanted = String(botId ?? '').trim()
+      // Bot 可能已经被删了：这时读文件会抛 ENOENT，别把异常当崩溃抛给界面。
+      let bot = null
+      try {
+        bot = await readBot(root, wanted)
+      } catch {
+        bot = null
+      }
+      if (!bot) return { ok: false, error: '这个 Bot 已经不在了' }
+      if (bot.status === 'disabled') return { ok: false, error: '这个 Bot 已停用' }
+      const parent = String(parentSession ?? '').trim()
+
+      const state = await readPrivateState(root)
+      const entry = privateEntryOf(state, bot.id)
+      // 只复用 0.7 的根会话。0.6 的子代理私聊会把内容漏进主会话，不再接。
+      if (entry && entry.kind === 'private' && reopen !== true) {
+        if (isArchived(entry.sessionId)) {
+          // 用户归档过：不把它拽回来，另开一条新的。旧的先标个「存档」，
+          // 免得列表里两条一模一样的名字分不清。
+          const now = new Date()
+          const day = `${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+          try {
+            await service('sessionController')?.rename?.({ sessionId: entry.sessionId, title: `${bot.name}（存档 ${day}）` })
+          } catch (error) {
+            await debug?.({ event: 'private-archive-title', bot: bot.id, ok: false, error: String(error?.message ?? error) })
+          }
+          await debug?.({ event: 'private-archived', bot: bot.id, sessionId: entry.sessionId })
+        } else {
+          // 老会话的标题可能是按第一句自动生成的「打招呼」：打开时顺手改回 Bot 的名字。
+          try {
+            const titles = service('sessionController')
+            await titles?.rename?.({ sessionId: entry.sessionId, title: bot.name })
+          } catch (error) {
+            await debug?.({ event: 'private-title', bot: bot.id, ok: false, error: String(error?.message ?? error) })
+          }
+          return {
+            ok: true,
+            sessionId: entry.sessionId,
+            parentSessionId: entry.parentSession ?? parent,
+            identity: chatIdentityOf(bot),
+            bot: bot.id,
+            reused: true,
+            // 复用也要标：根会话按普通会话开，走 subagentchat 地址会被拒。
+            standalone: true,
+          }
+        }
+      }
+
+      const controller = service('sessionController')
+      if (typeof controller?.create !== 'function' || typeof controller?.prompt !== 'function') {
+        return { ok: false, error: '这个版本不支持新建会话，开不了私聊' }
+      }
+      // 私聊自成一块：单独一个工作区目录，不跟用户的主工作区分在一起。
+      // 会话挂在这个目录上，左侧会多出一个「私聊会话」工作区，互相不干扰。
+      const chatRoot = join(root, 'chats')
+      try {
+        await mkdir(chatRoot, { recursive: true })
+      } catch {}
+      const cwd = chatRoot
+
+      // 招呼：有人设就按人设说，没有人设用固定句。
+      const soul = stripSoulPlaceholder(await readMemory(root, bot.id, 'soul.txt')).trim()
+      const fixed = `您好！我是${bot.name ?? bot.id}${bot.role ? `，负责${bot.role}` : ''}，很高兴能认识您。想找我私聊的话，点我的头像进来就行。`
+      const greeting = soul === ''
+        ? `请只回下面这一句，一个字都不要改，不要调用任何工具：\n${fixed}`
+        : [
+            '先看一眼你的设定，然后用一两句话跟我打个招呼：说出你的名字和岗位，再说明「想找我私聊的话，点我的头像进来就行」。',
+            '按你自己的说话方式写；不要用括号写动作，不要提「人设」「提示词」「系统」这些词，不要调用任何工具。',
+          ].join('\n')
+
+      let soulMtime = 0
+      try {
+        soulMtime = Number((await stat(join(root, 'bots', bot.id, 'memory', 'soul.txt'))).mtimeMs) || 0
+      } catch {
+        soulMtime = 0
+      }
+
+      const sessionId = `session-${randomUUID()}`
+      // 先把会话号写进 private.json：装饰是异步来的，它只认这份记录。
+      setPrivateEntry(state, bot.id, {
+        kind: 'private',
+        sessionId,
+        parentSession: parent,
+        cwd: cwd === '' ? null : cwd,
+        dir: null,
+        createdAt: Date.now(),
+        soulMtime,
+        // 未读不在这里加：等它真把招呼说出来、这一轮跑完，装饰那段的
+        // 状态监听会加一。这里加、那里也加，第一句就变成「2」了。
+        unread: entry?.unread ?? 0,
+        archivedCount: entry && entry.sessionId !== sessionId ? (entry.archivedCount ?? 0) + 1 : (entry?.archivedCount ?? 0),
+      })
+      await writePrivateState(root, state)
+
+      const decorated = expectPrivateDecoration(sessionId)
+      try {
+        await controller.create({ sessionId, ...(cwd === '' ? {} : { cwd }) })
       } catch (error) {
-        pending.delete(childId)
+        privateOpenings.delete(sessionId)
+        await debug?.({ event: 'private-create', bot: bot.id, ok: false, error: String(error?.message ?? error) })
+        return { ok: false, error: `私聊会话没建起来：${String(error?.message ?? error)}` }
+      }
+      // create 只写 cwd，不挂工作区；不挂的话左侧列表里没有这条会话。
+      const attached = await attachWorkspace(sessionId, cwd)
+      // 标题就用 Bot 的名字：改成用户来源，之后不会再被自动标题覆盖。
+      try {
+        await controller.rename?.({ sessionId, title: bot.name })
+      } catch (error) {
+        await debug?.({ event: 'private-title', bot: bot.id, ok: false, error: String(error?.message ?? error) })
+      }
+      // 第一句要等人设挂完，否则她第一次开口看不见自己的设定。
+      // 等太久就照发：装饰失败也不该让私聊打不开，下一轮会自己补上。
+      const waitMs = Number.isFinite(options?.privateDecorationWaitMs)
+        ? Number(options.privateDecorationWaitMs)
+        : 8000
+      let timer = null
+      const ready = await Promise.race([
+        decorated,
+        new Promise((done) => {
+          timer = setTimeout(() => done(false), waitMs)
+        }),
+      ])
+      if (timer !== null) clearTimeout(timer)
+      try {
+        await controller.prompt(
+          {
+            sessionId,
+            content: [{ type: 'text', text: greeting }],
+            requestId: `private-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 4)}`,
+          },
+          new AbortController().signal,
+        )
+      } catch (error) {
+        await debug?.({ event: 'private-greeting', bot: bot.id, ok: false, error: String(error?.message ?? error) })
+      }
+      options.api?.broadcast?.({ type: 'roster' })
+      await debug?.({
+        event: 'private-open',
+        bot: bot.id,
+        sessionId,
+        reopen: entry ? true : false,
+        decorated: ready === true,
+        workspace: attached,
+      })
+      return {
+        ok: true,
+        sessionId,
+        parentSessionId: parent,
+        identity: chatIdentityOf(bot),
+        bot: bot.id,
+        // 根会话不是子会话：客户端要按普通会话去开，不是 subagentchat 地址。
+        standalone: true,
+      }
+    }
+
+    /** 点开私聊：清未读。 */
+    options.api.markPrivateRead = async ({ botId }) => {
+      const state = await readPrivateState(root)
+      if (!privateEntryOf(state, String(botId ?? '').trim())) return { ok: true, unread: 0 }
+      clearPrivateUnread(state, String(botId ?? '').trim())
+      await writePrivateState(root, state)
+      options.api?.broadcast?.({ type: 'roster' })
+      return { ok: true, unread: 0 }
+    }
+
+    /** 私聊里的未读 +n：Bot 主动说话时用。 */
+    options.api.bumpPrivateUnread = async ({ botId, delta }) => {
+      const state = await readPrivateState(root)
+      const entry = privateEntryOf(state, String(botId ?? '').trim())
+      if (!entry) return { ok: false, unread: 0 }
+      const next = addPrivateUnread(state, String(botId ?? '').trim(), delta ?? 1)
+      await writePrivateState(root, state)
+      options.api?.broadcast?.({ type: 'roster' })
+      return { ok: true, unread: next }
+    }
+
+    /**
+     * 收拾「主人已经不在了」的私聊会话。
+     *
+     * 删掉 Bot 之后，它那条私聊还是一条普通会话，会一直留在左侧栏、点开还能接着聊。
+     * 这里把这条会话归档（会话记录不动，只是从列表里收起来），再把 private.json
+     * 里对应的条目摘掉；启动时也扫一遍，顺手清掉早期删 Bot 留下的孤儿会话。
+     * @param options - `{ only }`：只处理这一个 Bot（删 Bot 时传它；启动扫描不传）。
+     */
+    options.api.prunePrivateSessions = async ({ only } = {}) => {
+      const id = String(only ?? '').trim()
+      try {
+        const state = await readPrivateState(root)
+        const bots = new Set((await loadBots(root)).map((bot) => bot.id))
+        const registry = service('workspaceRegistry')
+        let archived = 0
+        let pruned = 0
+        for (const [botId, entry] of Object.entries(state.bots ?? {})) {
+          if (id !== '' && botId !== id) continue
+          if (bots.has(botId)) continue
+          const sessionId = String(entry?.sessionId ?? '')
+          let archivedIds = []
+          try {
+            archivedIds = Array.isArray(registry?.archivedSessionIds) ? registry.archivedSessionIds : []
+          } catch {
+            archivedIds = []
+          }
+          if (sessionId !== '' && typeof registry?.archiveSession === 'function' && !archivedIds.includes(sessionId)) {
+            try {
+              await registry.archiveSession(sessionId, { stopActivity: true })
+              archived += 1
+            } catch (error) {
+              await debug?.({ event: 'private-prune-archive-failed', bot: botId, error: String(error?.message ?? error) })
+            }
+          }
+          delete state.bots[botId]
+          pruned += 1
+        }
+        if (pruned > 0) {
+          await writePrivateState(root, state)
+          options.api?.broadcast?.({ type: 'roster' })
+        }
+        await debug?.({ event: 'private-prune', archived, pruned })
+        return { ok: true, archived, pruned }
+      } catch (error) {
+        await debug?.({ event: 'private-prune-failed', error: String(error?.message ?? error) })
         return { ok: false, error: String(error?.message ?? error) }
       }
+    }
+
+    /**
+     * 往私聊里推一句话（人设改了要她重新打招呼时用）。
+     *
+     * 私聊是根会话，没有 parent agent 可以走 `subagents.sendMessage`，
+     * 只能走 `sessionController.prompt`。
+     * @param options - `{ botId, text }`。
+     */
+    options.api.nudgePrivate = async ({ botId, text }) => {
+      const id = String(botId ?? '').trim()
+      const body = String(text ?? '').trim()
+      if (id === '' || body === '') return { ok: false, error: '缺少 bot 或内容' }
+      const state = await readPrivateState(root)
+      const entry = privateEntryOf(state, id)
+      if (!entry || entry.kind !== 'private') return { ok: false, error: '这个 Bot 还没有私聊' }
+      const controller = service('sessionController')
+      if (typeof controller?.prompt !== 'function') return { ok: false, error: '这个版本不能发消息' }
+      try {
+        await controller.prompt(
+          {
+            sessionId: entry.sessionId,
+            content: [{ type: 'text', text: body }],
+            requestId: `private-nudge-${Date.now().toString(36)}`,
+          },
+          new AbortController().signal,
+        )
+        await debug?.({ event: 'private-nudge', bot: id, ok: true })
+        return { ok: true }
+      } catch (error) {
+        await debug?.({ event: 'private-nudge', bot: id, ok: false, error: String(error?.message ?? error) })
+        return { ok: false, error: String(error?.message ?? error) }
+      }
+    }
+
+    /**
+     * 人设热更新：把已经开着的会话的人设段换掉，下一轮就按新设定说话。
+     *
+     * 只换人设段，底座与会话范围段不动——它们不随人设变；也正因为分开挂着，
+     * 才撤得干净。换完那一段这个会话的 prompt 缓存作废一次，这是代价。
+     * @param botId - 哪个 Bot 的人设改了。
+     */
+    options.api.refreshPersona = async (botId) => {
+      const id = String(botId ?? '').trim()
+      const bot = await readBot(root, id)
+      if (!bot) return { ok: false, error: '没有这个 Bot' }
+      const team = await readTeamMemory(root, memoryAudienceOf(bot))
+      const soul = stripSoulPlaceholder(await readMemory(root, id, 'soul.txt'))
+      const intro = `你是 ${bot.name ?? bot.id}，团队里的${bot.role ?? '成员'}。下面是你的设定——它只决定你怎么说话，不决定你做什么。`
+      const text = [intro, team, soul].filter(Boolean).join('\n\n')
+      // 人设段的 text 挂的是个取值函数，每次组装系统提示时现取，
+      // 所以这里只要把新文本塞进 personaTexts，不必碰任何会话的 ctx。
+      // 空闲会话的 ctx 已经不活，直接 section() 会抛（inactive context），
+      // 走函数这条路就跟会话活不活没关系了。
+      personaTexts.set(id, text)
+      let sessions = 0
+      for (const record of personas.values()) {
+        if (record?.botId === id) sessions += 1
+      }
+      await debug?.({ event: 'persona-refresh', bot: id, sessions, soul: Boolean(soul) })
+      return { ok: true, refreshed: sessions, soul: Boolean(soul) }
     }
 
     options.api.retry = async (taskId) => {
@@ -4262,7 +4808,7 @@ export function registerTeamTools(ctx, options) {
  *
  * @param options - agent, roster hit and the ledger plumbing.
  */
-function armChatCapture({ agent, hit, bot, tasks, persistTasks, broadcast, debug, usageBook }) {
+function armChatCapture({ agent, hit, bot, tasks, persistTasks, broadcast, debug, usageBook, private: isPrivate = false }) {
   if (!agent?.ctx?.on || !tasks) return
   if (hit?.kind === 'dispatch') return // 派活子会话由 dispatch 自己记账
 
@@ -4304,7 +4850,10 @@ function armChatCapture({ agent, hit, bot, tasks, persistTasks, broadcast, debug
       status: 'chat',
       verdict: 'accepted',
       output: trimmed.slice(0, 4000),
-      note: `单聊第 ${turns} 轮`,
+      // 私聊落账也要带 chatKind，否则名册会把它当成「本会话的工作聊天」，
+      // 点卡片就跳进私聊了。
+      ...(isPrivate ? { chatKind: 'private' } : {}),
+      note: `${isPrivate ? '私聊' : '单聊'}第 ${turns} 轮`,
     }
     // 真实 token：这一轮说话花掉的用量。
     if (usage) row.tokens = usage
@@ -4348,8 +4897,78 @@ function armChatCapture({ agent, hit, bot, tasks, persistTasks, broadcast, debug
  * @param ctx - plugin context.
  * @param options - `{ debug, pending }`.
  */
+/** 私聊里记住一条结论：超过 40 条就把最旧的挤掉，记忆是结论本，不是流水账。 */
+const REMEMBER_LINE_LIMIT = 40
+
+/**
+ * 给私聊会话注册唯一的工具 `remember`。
+ *
+ * 只在用户明说「记住」时才写：写进 `bots/<id>/memory/project.md`，带来源和日期。
+ * 它按调用时的 agent 作用域注册，所以别的会话看不到这个工具。
+ * @param params - `{ agent, bot, root, debug }`。
+ */
+function registerRememberTool({ agent, bot, root, debug }) {
+  // 服务优先从 ctx.get('tools') 拿；拿不到就退回 ctx.tools（不同版本的宿主写法不一样）。
+  let tools
+  try {
+    tools = typeof agent?.ctx?.get === 'function' ? agent.ctx.get('tools') : undefined
+  } catch {
+    tools = undefined
+  }
+  if (!tools) tools = agent?.ctx?.tools
+  if (!tools || typeof tools.register !== 'function') return false
+  tools.register({
+    name: 'remember',
+    description:
+      '只在用户明确说「记住 / 记一下 / 以后都这样」时用：把一条结论写进项目记忆。一次一条，写结论不写对话原文。',
+    parameters: {
+      text: { type: 'string', required: true, description: '一行结论，例如「用户不喜欢长篇汇报」' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: String(value) }],
+    },
+    async execute(args) {
+      const line = String(args?.text ?? '').trim().replace(/\s*\n\s*/g, ' ')
+      if (line === '') return '没有写入：text 是空的'
+      const now = new Date()
+      const day = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+      const memoryDir = join(root, 'bots', bot.id, 'memory')
+      const file = join(memoryDir, 'project.md')
+      const entry = `[私聊 ${day}] ${line}`
+      try {
+        await mkdir(memoryDir, { recursive: true })
+        let current = ''
+        try {
+          current = await readFile(file, 'utf8')
+        } catch {
+          current = ''
+        }
+        const all = current.split('\n').map((item) => item.trimEnd()).filter((item) => item.trim() !== '')
+        // 标题行（# 开头）永远留着，条数上限只数条目，别把表头当最旧的那行删掉。
+        const head = all.filter((item) => item.startsWith('#'))
+        const items = all.filter((item) => !item.startsWith('#'))
+        if (items.length >= REMEMBER_LINE_LIMIT) items.splice(0, items.length - REMEMBER_LINE_LIMIT + 1)
+        items.push(entry)
+        const lines = [...head, ...items]
+        await writeFile(file, `${lines.join('\n')}\n`, 'utf8')
+        const hash = await commitMemory(memoryDir, `memory: 私聊 ${line.slice(0, 30)}`)
+        await debug?.({ event: 'private-remember', bot: bot.id, chars: line.length, commit: hash })
+        return `已记下：${line}`
+      } catch (error) {
+        await debug?.({ event: 'private-remember', bot: bot.id, ok: false, error: String(error?.message ?? error) })
+        return `写入失败：${String(error?.message ?? error)}`
+      }
+    },
+  })
+  return true
+}
+
 export function installChildDecoration(ctx, options) {
   const { debug, pending, tasks, persistTasks, root, usageBook } = options
+  // 人设段的撤换句柄：改完人设要让「已经开着的会话」下一轮就吃到新设定，
+  // 就得知道该撤哪一段、往哪个 agent 上重挂。和 registerTeamTools 共用一份。
+  const personas = options.personas instanceof Map ? options.personas : new Map()
   const knowledgeOffs = []
   // 插件卸载时把注入的系统提示段落撤掉，否则重载会撞名、改内容也不生效。
   ctx.effect(() => () => {
@@ -4360,6 +4979,16 @@ export function installChildDecoration(ctx, options) {
         // 已卸载
       }
     }
+    for (const record of personas.values()) {
+      for (const off of Object.values(record?.offs ?? {})) {
+        try {
+          off?.()
+        } catch {
+          // 已卸载
+        }
+      }
+    }
+    personas.clear()
   })
   return ctx.on('agent/created', async ({ agent }) => {
     const header = agent?.session?.header ?? {}
@@ -4379,6 +5008,7 @@ export function installChildDecoration(ctx, options) {
             parentSession: entry.parentSession,
             cwd: entry.cwd ?? null,
             kind: 'chat',
+            chatKind: entry.chatKind ?? 'work',
           }
           kind = 'chat'
         } catch {
@@ -4394,6 +5024,19 @@ export function installChildDecoration(ctx, options) {
       kind,
     })
     pending.delete(header.id)
+    // 私聊会话：0.7 起它是独立的根会话，账本里没有它，只能靠 private.json 认人。
+    // 老会话在账本里带 chatKind='private'，一并认。
+    let privateChat = hit?.chatKind === 'private'
+    let privateBot = ''
+    if (!privateChat) {
+      try {
+        const privateState = await readPrivateState(root)
+        privateBot = privateBotOfSession(privateState, header.id) ?? ''
+        privateChat = privateBot !== ''
+      } catch {
+        privateChat = false
+      }
+    }
     // 恢复出来的子会话进这里：续聊等回复时 agents.get 可能拿不到它。
     if (hit) {
       liveChildren.set(header.id, agent)
@@ -4405,32 +5048,101 @@ export function installChildDecoration(ctx, options) {
         agent.ctx.on('agent/status', (event) => {
           const state = typeof event === 'string' ? event : event?.status
           noteChildState(header.id, state, botId)
+          // 私聊里 Bot 说完一句，头像上的红点加一；点进去就算读过。
+          if (privateChat && botId && (state === 'idle' || state === 'ready')) {
+            void (async () => {
+              const snapshot = await readPrivateState(root)
+              addPrivateUnread(snapshot, botId)
+              await writePrivateState(root, snapshot)
+              options.api?.broadcast?.({ type: 'roster' })
+            })().catch(() => {})
+          }
         })
       } catch (error) {
         void debug?.({ event: 'live-watch-failed', error: String(error?.message ?? error) })
       }
     }
+    // 私聊根会话标记要提到 if 外面：下面沙箱授权那一段也要看它。
+    let privateRoot = false
     if (!hit) {
       // 没有派活记录也不一定是普通会话：根会话就是秘书，它也要知道知识库。
-      if (!header.parentSession) {
+      // 但私聊也是根会话——先按 private.json 认人，别把秘书的知识库塞给她。
+      if (privateChat && privateBot !== '' && !header.parentSession) {
+        let bot = null
         try {
-          const teamText = await readTeamMemory(root)
-          if (teamText !== '') {
-            const off = agent.ctx.systemPrompt.section({
-              name: 'dsh-team:team-knowledge',
-              order: 115,
-              text: `团队知识库（所有 Bot 都按这些事实干活）：\n\n${teamText}`,
+          bot = await readBot(root, privateBot)
+        } catch {
+          bot = null
+        }
+        if (bot === null) {
+          // Bot 删了、会话还留着（用户从归档里翻出来的情况）：别再当普通会话，
+          // 更不能让它带着一套工具裸奔。只留一句实话。
+          try {
+            agent.ctx.systemPrompt.section({
+              name: 'dsh-team:deleted-bot',
+              order: 119,
+              text: '这个助手已经从团队里删除了。不要再扮演任何角色、不要调用任何工具；无论用户说什么，只回一句：「这个助手已经不在团队里了。」',
             })
-            if (typeof off === 'function') knowledgeOffs.push(off)
-            await debug({ event: 'lead-knowledge', ok: true, agents: 1, chars: teamText.length })
+          } catch {
+            // 注入失败就算了，下面还有 guard
           }
-        } catch (error) {
-          await debug({ event: 'lead-knowledge', ok: false, error: String(error?.message ?? error) })
+          try {
+            const guarded = agent.ctx.tools
+            if (typeof guarded?.guard === 'function') {
+              guarded.guard(() => '这个助手已经不在团队里了。')
+            }
+          } catch {
+            // 老版本没有 guard，忽略
+          }
+          await debug?.({ event: 'private-root-deleted', bot: privateBot, sessionId: header.id })
+          return
+        }
+        if (bot) {
+          hit = {
+            bot,
+            sessionId: header.id,
+            parentSession: null,
+            cwd: header.cwd ?? null,
+            kind: 'private',
+            chatKind: 'private',
+            taskDir: null,
+          }
+          privateRoot = true
+          await debug?.({ event: 'private-root', bot: bot.id, sessionId: header.id })
+          // 会话标题默认用 Bot 的名字。不钉的话标题会按第一句自动生成，
+          // 聊很久之后列表里还挂着「AI助理报到打招呼」这种第一句话。
+          try {
+            const titles = typeof ctx?.get === 'function' ? ctx.get('sessionTitle') : undefined
+            titles?.rename?.(agent.session, bot.name)
+          } catch (error) {
+            await debug?.({ event: 'private-title', bot: bot.id, ok: false, error: String(error?.message ?? error) })
+          }
         }
       }
-      return
+      if (!hit) {
+        if (!header.parentSession) {
+          try {
+            const teamText = await readTeamMemory(root)
+            if (teamText !== '') {
+              const off = agent.ctx.systemPrompt.section({
+                name: 'dsh-team:team-knowledge',
+                order: 115,
+                text: `团队知识库（所有 Bot 都按这些事实干活）：\n\n${teamText}`,
+              })
+              if (typeof off === 'function') knowledgeOffs.push(off)
+              await debug({ event: 'lead-knowledge', ok: true, agents: 1, chars: teamText.length })
+            }
+          } catch (error) {
+            await debug({ event: 'lead-knowledge', ok: false, error: String(error?.message ?? error) })
+          }
+        }
+        return
+      }
+      // 私聊根会话记下来：装饰结束后要放行等在第一句话那里的调用。
+      if (privateRoot) hit = { ...hit, privateRoot: true }
     }
 
+    // 私聊判定在上面那一段就做了（状态监听也要用），这里不再重复读一遍。
 
     // 真实 token：每一步模型都会推一个 usage 块，按子会话攒着，结算时领走。
     if (usageBook && agent?.ctx?.on) {
@@ -4454,6 +5166,16 @@ export function installChildDecoration(ctx, options) {
         sandboxPolicy.registerWritableRoot(agent.session, hit.taskDir)
         writableRootRegistered = true
       }
+      // 私聊没有任务目录，但 `remember` 要往 bots/<id>/memory 里写一行；
+      // 那条路在 DSH_HOME 下，不显式挂进授权就会被沙箱挡掉。
+      if (!writableRootRegistered && privateRoot && hit?.bot?.id) {
+        const memoryDir = join(root, 'bots', hit.bot.id, 'memory')
+        await mkdir(memoryDir, { recursive: true }).catch(() => {})
+        if (typeof sandboxPolicy?.registerWritableRoot === 'function') {
+          sandboxPolicy.registerWritableRoot(agent.session, memoryDir)
+          writableRootRegistered = true
+        }
+      }
     } catch (error) {
       await debug?.({ event: 'sandbox-root', ok: false, error: String(error?.message ?? error) })
     }
@@ -4473,7 +5195,7 @@ export function installChildDecoration(ctx, options) {
       const soul = stripSoulPlaceholder(rawSoul)
       // 底座单独一段、排在人设前面：用户改 soul / persona 只会换掉人设，
       // 换不掉这一段。
-      agent.ctx.systemPrompt.section({
+      const offBase = agent.ctx.systemPrompt.section({
         name: BASE_RULES_SECTION,
         order: BASE_RULES_ORDER,
         text: BASE_RULES,
@@ -4483,49 +5205,125 @@ export function installChildDecoration(ctx, options) {
       // 每个人设只认 soul.txt 一份：JSON 里的 persona 已经迁移掉了，不再注入，
       // 不然用户在文件里改了却不生效。
       const text = [intro, team, soul].filter(Boolean).join('\n\n')
-      agent.ctx.systemPrompt.section({
+      // 人设段给的是取值函数：每次组装系统提示时现取 personaTexts 里那一份，
+      // 用户改完 soul.txt 只要更新那份（refreshPersona），开着的会话下一轮就跟上，
+      // 不必去碰任何会话的 ctx（空闲会话的 ctx 不活，直接重挂会抛）。
+      personaTexts.set(hit.bot.id, text)
+      const offPersona = agent.ctx.systemPrompt.section({
         name: PERSONA_SECTION,
-        order: 120,
-        text,
+        order: PERSONA_ORDER,
+        text: () => personaTexts.get(hit.bot.id) ?? text,
       })
       // 会话范围单列一段、排在人设之后：AGENTS.md 是宿主塞进来的用户消息，插件删不掉，
       // 只能在 system prompt 里把「哪一份设定说了算」写死。
-      agent.ctx.systemPrompt.section({
+      const offScope = agent.ctx.systemPrompt.section({
         name: SCOPE_SECTION,
         order: SCOPE_ORDER,
         text: SCOPE_RULES,
       })
-      await debug?.({ event: 'persona', bot: hit.bot.id, ok: true, soul: Boolean(soul), rules: true })
+      const offs = { base: offBase, persona: offPersona, scope: offScope }
+      // 私聊也要单列一段：私聊里不汇报进度、不调工具，这条对所有 Bot 一律生效。
+      if (privateChat) {
+        offs.private = agent.ctx.systemPrompt.section({
+          name: PRIVATE_SECTION,
+          order: PRIVATE_ORDER,
+          text: PRIVATE_RULES,
+        })
+      }
+      if (typeof offPersona === 'function') {
+        personas.set(header.id, { botId: hit.bot.id, agent, offs, text })
+      }
+      await debug?.({ event: 'persona', bot: hit.bot.id, ok: true, soul: Boolean(soul), rules: true, private: privateChat })
 
       // Capability card: a positive allow list wins; otherwise deny the tools
       // this bot must never use. Unknown names are skipped one by one so a
       // stale card does not break creation.
-      const plan = capabilityPlan(hit.bot)
-      const denied = []
-      const allowed = []
-      const skipped = []
-      if (plan.allow !== undefined) {
+      if (privateChat) {
+        // 私聊里只留一个工具：记住。其余全局工具一律挡掉——私聊不干活。
+        // 这个工具是按会话作用域注册的，所以挡住全局也不会把它一起挡掉。
         try {
-          agent.ctx.tools.restrict({ allow: plan.allow })
-          allowed.push(...plan.allow)
+          registerRememberTool({ agent, bot: hit.bot, root, debug })
         } catch (error) {
-          await debug?.({ event: 'capability-allow-failed', bot: hit.bot.id, error: String(error?.message ?? error) })
+          await debug?.({ event: 'remember-tool', bot: hit.bot.id, ok: false, error: String(error?.message ?? error) })
+        }
+        try {
+          const tools = agent.ctx.tools
+          const list = typeof tools?.definitions === 'function' ? tools.definitions() : []
+          const names = (Array.isArray(list) ? list : [])
+            .map((tool) => String(tool?.name ?? ''))
+            .filter((name) => name !== '' && name !== 'remember')
+          if (names.length > 0) tools.restrict({ deny: names })
+          // 有些工具是登记在这个会话自己的作用域里的，restrict 挡不掉（改不了别人的注册）。
+          // 所以在执行口加一道守卫：私聊里除了 remember，一律拒绝——挡的是「用」，不是「看见」。
+          if (typeof tools?.guard === 'function') {
+            tools.guard((exec) => {
+              const name = String(exec?.name ?? '')
+              if (name === '' || name === 'remember') return undefined
+              return '私聊里不做事。要办正事，点我的卡片打开工作聊天，我在那边接。'
+            })
+            await debug?.({ event: 'private-guard', bot: hit.bot.id, ok: true })
+          }
+          let afterCount = -1
+          let afterSample = ''
+          try {
+            const after = typeof tools?.definitions === 'function' ? tools.definitions(agent) : []
+            afterCount = Array.isArray(after) ? after.length : -1
+            afterSample = (Array.isArray(after) ? after : []).map((tool) => String(tool?.name ?? '')).slice(0, 10).join(',')
+          } catch (error) {
+            afterSample = `view-failed:${String(error?.message ?? error)}`
+          }
+          await debug?.({ event: 'private-tools', bot: hit.bot.id, denied: names.length, after: afterCount, sample: afterSample })
+        } catch (error) {
+          await debug?.({ event: 'private-tools', bot: hit.bot.id, ok: false, error: String(error?.message ?? error) })
         }
       } else {
-        for (const name of plan.deny) {
+        const plan = capabilityPlan(hit.bot)
+        const denied = []
+        const allowed = []
+        const skipped = []
+        if (plan.allow !== undefined) {
           try {
-            agent.ctx.tools.restrict({ deny: [name] })
-            denied.push(name)
-          } catch {
-            skipped.push(name)
+            agent.ctx.tools.restrict({ allow: plan.allow })
+            allowed.push(...plan.allow)
+          } catch (error) {
+            await debug?.({ event: 'capability-allow-failed', bot: hit.bot.id, error: String(error?.message ?? error) })
+          }
+        } else {
+          for (const name of plan.deny) {
+            try {
+              agent.ctx.tools.restrict({ deny: [name] })
+              denied.push(name)
+            } catch {
+              skipped.push(name)
+            }
           }
         }
+        await debug?.({ event: 'capability', bot: hit.bot.id, denied, allowed, skipped })
       }
-      await debug?.({ event: 'capability', bot: hit.bot.id, denied, allowed, skipped })
+
+      // 团队协作只在主会话开：Bot 的会话（工作聊天、派活子会话）里再补一道执行口守卫，
+      // 免得有人把 team_dispatch 写进能力卡 allow 里，绕过 deny 继续套娃。
+      if (!privateChat) {
+        try {
+          const tools = agent.ctx.tools
+          if (typeof tools?.guard === 'function') {
+            tools.guard((exec) => {
+              const name = String(exec?.name ?? '')
+              // 记忆那几个留着：Bot 还得记自己的教训。
+              if (!name.startsWith('team_')) return undefined
+              if (name.startsWith('team_memory_') || name === 'team_recall') return undefined
+              return '团队协作只在主会话开。你是被叫来说话 / 干活的，要派活回主会话找秘书。'
+            })
+            await debug?.({ event: 'bot-no-team', bot: hit.bot.id, ok: true })
+          }
+        } catch (error) {
+          await debug?.({ event: 'bot-no-team', bot: hit.bot.id, ok: false, error: String(error?.message ?? error) })
+        }
+      }
 
       // 原生「启用智能体团队协作」：Bot 拿不到 dsh-team 的团队工具（那会无限套娃），
       // 但可以按它自己的开关用 DSH 自带的子智能体。
-      if (hit.bot.agentTeam === true) {
+      if (!privateChat && hit.bot.agentTeam === true) {
         try {
           const agentTeams = typeof ctx.get === 'function' ? ctx.get('agentTeams') : undefined
           if (typeof agentTeams?.setEnabled === 'function') {
@@ -4540,9 +5338,16 @@ export function installChildDecoration(ctx, options) {
       }
 
       // 单聊回传：团队子会话里聊出来的内容也记账。派活子会话跳过，免得重复。
-      armChatCapture({ agent, hit, bot: hit.bot, tasks, persistTasks, broadcast: options.api?.broadcast, debug, usageBook })
+      // 私聊根会话不进账本（它本来就不是子会话），也就不必记。
+      if (!hit.privateRoot) {
+        armChatCapture({ agent, hit, bot: hit.bot, tasks, persistTasks, broadcast: options.api?.broadcast, debug, usageBook, private: privateChat })
+      }
     } catch (error) {
       await debug?.({ event: 'persona', bot: hit.bot.id, ok: false, error: String(error?.message ?? error) })
+    } finally {
+      // 私聊根会话：不管装饰成没成，都放行等在第一句话那里的 openPrivate，
+      // 否则它要干等到 8 秒超时。
+      if (privateChat) settlePrivateDecoration(header.id)
     }
   })
 }

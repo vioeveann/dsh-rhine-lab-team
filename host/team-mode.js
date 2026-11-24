@@ -12,6 +12,7 @@ import { spawn } from 'node:child_process'
 import { BUILTIN_BOTS, listRemovedBuiltins, rememberRemovedBuiltin, restoreBuiltinBot } from './builtin-bots.js'
 import { clearBackground, deleteBot, findAvatar, findBackground, loadBots, normalizeBot, renameBot, saveAvatar, saveBackground, saveBot, soulTemplate, stripSoulPlaceholder } from './bots.js'
 import { listSnapshots } from './memory.js'
+import { blankPrivateState, readPrivateState } from './private-chat.js'
 import { addActionBot, botsForSession, explicitTeamBots, loadTeams, saveTeams, setSessionTeam } from './teams.js'
 import { createGroup, groupOf, loadGroups, normalizeGroups, removeGroup, renameGroup, saveGroups } from './groups.js'
 import { join } from 'node:path'
@@ -22,6 +23,8 @@ import { commitMemory } from './memory.js'
 import { runningBots } from './live-watch.js'
 
 const SWITCH_ROUTE = '/dsh-team/team-mode'
+/** 某个会话是不是 Bot 的私聊 / 工作聊天（客户端据此藏「团队协作」开关）。 */
+const SESSION_KIND_ROUTE = '/dsh-team/session-kind'
 const ROSTER_ROUTE = '/dsh-team/roster'
 const TASKS_ROUTE = '/dsh-team/tasks'
 /** 单件任务：member 卡片用它同步真实状态（卡里的状态是写死的历史文本）。 */
@@ -53,6 +56,8 @@ const TEAM_BOTS_ROUTE = '/dsh-team/team-bots'
 const GROUPS_ROUTE = '/dsh-team/groups'
 const MODELS_ROUTE = '/dsh-team/models'
 const OPEN_ROUTE = '/dsh-team/open'
+const PRIVATE_OPEN_ROUTE = '/dsh-team/private/open'
+const PRIVATE_READ_ROUTE = '/dsh-team/private/read'
 const GROWTH_ROUTE = '/dsh-team/growth'
 const IMPROVE_ROUTE = '/dsh-team/improve'
 const TASK_EXPORT_ROUTE = '/dsh-team/task-export'
@@ -321,10 +326,36 @@ export function installTeamMode(ctx, options) {
           json(res, 400, { error: 'sessionId required' })
           return
         }
+        // Bot 的私聊 / 工作聊天里没有团队协作：开着只会让它自己派活给自己，套娃。
+        const botChat = typeof api?.botChatOf === 'function' ? await api.botChatOf(sessionId) : ''
+        if (Boolean(body.on) && botChat !== '') {
+          state.set(sessionId, false)
+          await save()
+          void debug({ event: 'team-mode-blocked', sessionId, kind: botChat })
+          json(res, 200, { ok: true, sessionId, on: false, blocked: true, kind: botChat })
+          return
+        }
         state.set(sessionId, Boolean(body.on))
         await save()
         void debug({ event: 'team-mode', sessionId, on: Boolean(body.on) })
         json(res, 200, { ok: true, sessionId, on: Boolean(body.on) })
+      } catch (error) {
+        json(res, 400, { error: String(error?.message ?? error) })
+      }
+    },
+  })
+
+  // 客户端要藏「团队协作」开关时问一句：这个会话是不是 Bot 的私聊 / 工作聊天。
+  const disposeSessionKind = registerRoute({
+    kind: 'exact',
+    path: SESSION_KIND_ROUTE,
+    async handler(req, res) {
+      await load
+      try {
+        const url = new URL(req.url ?? '', 'http://localhost')
+        const sessionId = String(url.searchParams.get('sessionId') ?? '').trim()
+        const kind = sessionId === '' || typeof api?.botChatOf !== 'function' ? '' : await api.botChatOf(sessionId)
+        json(res, 200, { sessionId, kind, botChat: kind !== '' })
       } catch (error) {
         json(res, 400, { error: String(error?.message ?? error) })
       }
@@ -593,6 +624,17 @@ export function installTeamMode(ctx, options) {
               fresh = saved
             }
           }
+          // 新 Bot：落盘后直接在后台起一条私聊，让它自己打个招呼。
+          // 不打开界面、不进会话——面板头像右上角一个红点就够了。
+          if (previous === null && typeof body.sessionId === 'string' && body.sessionId.trim() !== '') {
+            try {
+              void Promise.resolve(
+                api?.openPrivate?.({ botId: saved.id, parentSession: body.sessionId.trim() }),
+              ).catch(() => {})
+            } catch {
+              // 招呼起不来不影响创建本身
+            }
+          }
           broadcast({ type: 'roster' })
           void debug({ event: 'bot-saved', id: saved.id })
           json(res, 200, { ok: true, bot: fresh, roleChanged })
@@ -620,9 +662,16 @@ export function installTeamMode(ctx, options) {
             // 读不到就按行动预备组处理
           }
           const result = await deleteBot(root, id)
+          // 人删了，它那条私聊会话就没人管了：归档收起来，别留在左侧栏还能聊。
+          let pruned = 0
+          try {
+            pruned = (await api?.prunePrivateSessions?.({ only: id }))?.pruned ?? 0
+          } catch {
+            pruned = 0
+          }
           broadcast({ type: 'roster' })
-          void debug({ event: 'bot-deleted', id, ok: result.ok })
-          json(res, result.ok ? 200 : 400, result)
+          void debug({ event: 'bot-deleted', id, ok: result.ok, pruned })
+          json(res, result.ok ? 200 : 400, { ...result, pruned })
         } catch (error) {
           json(res, 400, { ok: false, error: String(error?.message ?? error) })
         }
@@ -700,6 +749,9 @@ export function installTeamMode(ctx, options) {
               'utf8',
             )
           }
+          // 编辑器保存不经过插件，只能盯一会儿文件：看它变了就把活着会话的人设换掉。
+          // 打开失败也照样盯——面板会把路径给他，手动打开改也是改。
+          options.armPersona?.(bot, file)
           // 用系统默认程序打开；打不开就把路径回给面板，让它自己提示。
           try {
             await openInEditor(file)
@@ -1129,6 +1181,48 @@ export function installTeamMode(ctx, options) {
           chatSessionId: String(body.chatSessionId ?? ''),
         })
         json(res, 200, result ?? { ok: false, error: '单聊接口没接上' })
+      } catch (error) {
+        json(res, 400, { ok: false, error: String(error?.message ?? error) })
+      }
+    },
+  })
+
+  const disposePrivateOpen = registerRoute({
+    kind: 'exact',
+    path: PRIVATE_OPEN_ROUTE,
+    async handler(req, res) {
+      if (req.method !== 'POST') {
+        res.writeHead(405, { allow: 'POST' })
+        res.end()
+        return
+      }
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        const result = await api?.openPrivate?.({
+          botId: String(body.bot ?? ''),
+          parentSession: String(body.sessionId ?? ''),
+          reopen: body.reopen === true,
+        })
+        json(res, 200, result ?? { ok: false, error: '私聊接口没接上' })
+      } catch (error) {
+        json(res, 400, { ok: false, error: String(error?.message ?? error) })
+      }
+    },
+  })
+
+  const disposePrivateRead = registerRoute({
+    kind: 'exact',
+    path: PRIVATE_READ_ROUTE,
+    async handler(req, res) {
+      if (req.method !== 'POST') {
+        res.writeHead(405, { allow: 'POST' })
+        res.end()
+        return
+      }
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        const result = await api?.markPrivateRead?.({ botId: String(body.bot ?? '') })
+        json(res, 200, result ?? { ok: true })
       } catch (error) {
         json(res, 400, { ok: false, error: String(error?.message ?? error) })
       }
@@ -1619,6 +1713,7 @@ export function installTeamMode(ctx, options) {
       }
       disposeBuiltin()
       disposeSwitch()
+      disposeSessionKind()
       disposeRoster()
       disposeTasks()
       disposeTaskOne()
@@ -1633,6 +1728,8 @@ export function installTeamMode(ctx, options) {
       disposeTaskExport()
       disposeGrowth()
       disposeOpen()
+      disposePrivateOpen()
+      disposePrivateRead()
       disposeModels()
       disposeGroups()
       disposeTeamBots()
@@ -1680,17 +1777,36 @@ export async function readRoster(options) {
     return []
   }
 
-  // Most recent child session per bot, so the panel can open its chat.
+  // Most recent work-chat child session per bot, in THIS session, so the panel
+  // can open it. 私聊不算在内：私聊一个 Bot 只有一条，跨主会话复用，
+  // 记在 .state/private.json 里，这里单独取。
+  // 私聊状态：未读数与固定会话号。
+  let privateState = blankPrivateState()
+  try {
+    privateState = await readPrivateState(root)
+  } catch {
+    privateState = blankPrivateState()
+  }
+  const privateSessions = new Map(
+    Object.entries(privateState.bots ?? {})
+      .filter(([, entry]) => typeof entry?.sessionId === 'string' && entry.sessionId !== '')
+      .map(([id, entry]) => [entry.sessionId, id]),
+  )
+
   const latestSession = new Map()
   for (const entry of tasks.values()) {
     if (!entry.sessionId) continue
+    if (entry.chatKind === 'private') continue
+    // 老账本里的私聊轮次没带 chatKind，靠 private.json 里的会话号再挡一次。
+    if (privateSessions.get(entry.sessionId) === entry.bot) continue
+    if (sessionId && entry.parentSession !== sessionId) continue
     const seen = latestSession.get(entry.bot)
     if (!seen || (entry.startedAt ?? 0) > (seen.startedAt ?? 0)) {
       latestSession.set(entry.bot, {
-      sessionId: entry.sessionId,
-      parentSession: entry.parentSession ?? null,
-      startedAt: entry.startedAt,
-    })
+        sessionId: entry.sessionId,
+        parentSession: entry.parentSession ?? null,
+        startedAt: entry.startedAt,
+      })
     }
   }
 
@@ -1778,10 +1894,21 @@ export async function readRoster(options) {
           tokensBreakdown: { input: all.input, output: all.output, cacheRead: all.cacheRead },
         }
       })(),
-      // 这个会话里有没有干过活：决定「待命」还是「空闲」。
-      worked: [...tasks.values()].some((entry) => entry.bot === bot.id && entry.parentSession === sessionId),
+      // 这个会话里有没有干过活：决定「待命」还是「空闲」，也决定点卡片去哪。
+      // 私聊不算活儿——否则新会话里一点卡片就被送进私聊。
+      worked: [...tasks.values()].some(
+        (entry) =>
+          entry.bot === bot.id &&
+          entry.parentSession === sessionId &&
+          entry.chatKind !== 'private' &&
+          privateSessions.get(entry.sessionId) !== bot.id,
+      ),
       sessionId: latestSession.get(bot.id)?.sessionId ?? null,
       parentSessionId: latestSession.get(bot.id)?.parentSession ?? null,
+      // 私聊：一个 Bot 只有一条，跨主会话复用。
+      privateUnread: privateState.bots[bot.id]?.unread ?? 0,
+      privateSessionId: privateState.bots[bot.id]?.sessionId ?? null,
+      privateArchived: Number(privateState.bots[bot.id]?.archivedCount ?? 0),
     })
   }
   return members

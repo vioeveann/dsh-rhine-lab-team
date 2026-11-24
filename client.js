@@ -643,11 +643,47 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 这个会话是不是 Bot 的私聊 / 工作聊天。是的话「团队协作」整块不显示：
+     * 团队协作只在主会话里有意义，Bot 会话里开着就是自己派活给自己。
+     * 答案按会话缓存一次，切会话时不再问。
+     */
+    const botChatKinds = new Map()
+
+    function useBotChatKind(props) {
+      const sessionId = resolveSessionId(props)
+      const [kind, setKind] = React.useState(() => botChatKinds.get(sessionId) ?? '')
+      React.useEffect(() => {
+        setKind(botChatKinds.get(sessionId) ?? '')
+        if (sessionId === '' || sessionId === 'unknown') return undefined
+        if (botChatKinds.has(sessionId)) return undefined
+        if (typeof globalThis.fetch !== 'function') return undefined
+        let alive = true
+        void (async () => {
+          try {
+            const res = await fetch(`/dsh-team/session-kind?sessionId=${encodeURIComponent(sessionId)}`)
+            if (!res.ok) return
+            const data = await res.json()
+            const next = typeof data?.kind === 'string' ? data.kind : ''
+            botChatKinds.set(sessionId, next)
+            if (alive) setKind(next)
+          } catch {
+            // 问不到就当普通会话：藏开关是小，报错是大。
+          }
+        })()
+        return () => {
+          alive = false
+        }
+      }, [sessionId])
+      return kind
+    }
+
+    /**
      * 「团队协作」开关：一个方框 + 一条缎带。
      * 方框是真 checkbox（点整条都能切，键盘空格也行）；缎带是薄荷底英文前缀、琥珀底中文、
      * 橙红两格收尾。关着的时候缎带去色压暗，方框空着。
      */
     function TeamToggle(props) {
+      const botChatKind = useBotChatKind(props)
       const [on, toggle] = useTeamFlag(props)
       const ribbon = (background, color, text, extra) => h(
         'span',
@@ -668,6 +704,8 @@ window.__ModuleLoader__.load({
         },
         text,
       )
+      // Bot 的私聊 / 工作聊天里没有团队协作：整个开关都不显示。
+      if (botChatKind !== '') return null
       return h(
         'label',
         {
@@ -777,22 +815,39 @@ async function publishTeamIdentity(force = false) {
       fetch('/dsh-team/tasks').then((response) => (response.ok ? response.json() : null)).catch(() => null),
       fetch('/dsh-team/roster').then((response) => (response.ok ? response.json() : null)).catch(() => null),
     ])
-    const map = { ...(identity?.map ?? {}) }
+    // 起点带上已经写进去的那份：私聊是根会话、不在账本里，
+    // 只按账本重拼会把它刚写进去的那条冲掉，头像回落成主会话的。
+    let stored = {}
+    try {
+      const previous = localStorage.getItem(TEAM_IDENTITY_KEY)
+      if (previous !== null) stored = JSON.parse(previous) ?? {}
+    } catch {
+      stored = {}
+    }
+    const map = { ...stored, ...(identity?.map ?? {}) }
     const names = new Map()
     for (const member of roster?.members ?? []) {
       if (member?.id) names.set(String(member.id), member.name ?? member.id)
+    }
+    const identityOf = (bot) => ({
+      id: bot,
+      name: names.get(bot) ?? bot,
+      src: `/dsh-team/avatar?bot=${encodeURIComponent(bot)}&v=3`,
+      onOpen: true,
+      speech: false,
+    })
+    // 私聊就是一条独立根会话：账本里没有它，得按名册的 privateSessionId 补。
+    for (const member of roster?.members ?? []) {
+      const sessionId = String(member?.privateSessionId ?? '').trim()
+      const bot = String(member?.id ?? '').trim()
+      if (sessionId === '' || bot === '') continue
+      map[sessionId] = identityOf(bot)
     }
     for (const task of list?.tasks ?? []) {
       const sessionId = String(task?.sessionId ?? '').trim()
       const bot = String(task?.bot ?? '').trim()
       if (sessionId === '' || bot === '') continue
-      map[sessionId] = {
-        id: bot,
-        name: names.get(bot) ?? bot,
-        src: `/dsh-team/avatar?bot=${encodeURIComponent(bot)}&v=3`,
-        onOpen: true,
-        speech: false,
-      }
+      map[sessionId] = identityOf(bot)
     }
     const raw = JSON.stringify(map)
     if (!force && raw === lastIdentityRaw) return
@@ -1576,7 +1631,7 @@ function createMembersPanel(React, host) {
     )
   }
 
-  const PanelMemberCard = React.memo(function PanelMemberCard({ member, onOpen, onOpenSession, onOpenMailbox, hint, onSettings, onPromote, onArchive, onRemove }) {
+  const PanelMemberCard = React.memo(function PanelMemberCard({ member, onOpen, onOpenSession, onOpenPrivate, onOpenMailbox, hint, onSettings, onPromote, onArchive, onRemove }) {
     const skin = useSkin()
     const p = palette()
     const aurora = false
@@ -1652,25 +1707,77 @@ function createMembersPanel(React, host) {
           })
         : null,
       // 头像统一走接口：上传过就是图片，没上传由服务端给默认剪影。
-      h('img', {
-        // 版本号用来劈开浏览器缓存：默认头像的字样/样式改了就换个数字。
-        src: `/dsh-team/avatar?bot=${encodeURIComponent(member.id)}&v=3`,
-        alt: '',
-        loading: 'lazy',
-        decoding: 'async',
-        draggable: false,
-        style: {
-          flex: '0 0 auto',
-          position: 'relative',
-          zIndex: 1,
-          width: aurora ? 46 : 52,
-          height: aurora ? 46 : 52,
-          borderRadius: aurora ? 0 : '50%',
-          border: aurora ? `1px solid ${p.line}` : 'none',
-          objectFit: 'cover',
-          background: p.raised,
+      // 点头像 = 进私聊；私聊有没读的话在右上角点一个红点。
+      h(
+        'div',
+        {
+          role: 'button',
+          tabIndex: 0,
+          title: '点头像和她单独说话',
+          onClick: (event) => {
+            event.stopPropagation()
+            onOpenPrivate?.(member)
+          },
+          onKeyDown: (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.stopPropagation()
+              onOpenPrivate?.(member)
+            }
+          },
+          style: {
+            flex: '0 0 auto',
+            position: 'relative',
+            zIndex: 1,
+            display: 'flex',
+            alignItems: 'center',
+            cursor: 'pointer',
+          },
         },
-      }),
+        h('img', {
+          // 版本号用来劈开浏览器缓存：默认头像的字样/样式改了就换个数字。
+          src: `/dsh-team/avatar?bot=${encodeURIComponent(member.id)}&v=3`,
+          alt: '',
+          loading: 'lazy',
+          decoding: 'async',
+          draggable: false,
+          style: {
+            flex: '0 0 auto',
+            width: aurora ? 46 : 52,
+            height: aurora ? 46 : 52,
+            borderRadius: aurora ? 0 : '50%',
+            border: aurora ? `1px solid ${p.line}` : 'none',
+            objectFit: 'cover',
+            background: p.raised,
+          },
+        }),
+        Number(member?.privateUnread) > 0
+          ? h(
+              'span',
+              {
+                'aria-label': `${Number(member.privateUnread)} 条没读`,
+                title: '私聊里有没读的话',
+                style: {
+                  position: 'absolute',
+                  top: -2,
+                  right: -2,
+                  minWidth: 15,
+                  height: 15,
+                  padding: '0 4px',
+                  boxSizing: 'border-box',
+                  borderRadius: 999,
+                  background: '#E77547',
+                  color: '#fff',
+                  fontSize: 9,
+                  lineHeight: '15px',
+                  fontWeight: 600,
+                  textAlign: 'center',
+                  pointerEvents: 'none',
+                },
+              },
+              Number(member.privateUnread) > 99 ? '99+' : String(Number(member.privateUnread)),
+            )
+          : null,
+      ),
       h(
         'div',
         {
@@ -3768,7 +3875,7 @@ function createMembersPanel(React, host) {
    * 招募表单：组底下原地展开的新建界面，浅色，带模型下拉和能力卡。
    * @param props - { groupId, groupName, onDone }。
    */
-  function RecruitInline({ groupId, groupName, onDone }) {
+  function RecruitInline({ groupId, groupName, sessionId, onDone }) {
     const [form, setForm] = React.useState({
       id: "",
       name: "",
@@ -3822,6 +3929,8 @@ function createMembersPanel(React, host) {
           ...(form.stars > 0 ? { stars: form.stars } : {}),
           ...(Object.keys(tools).length === 0 ? {} : { capability: { tools } }),
           ...(groupId === "" ? {} : { group: groupId }),
+          // 带上当前会话：宿主靠它起一次「报到招呼」，红点出现在头像上。
+          ...(sessionId ? { sessionId } : {}),
         }
         const response = await fetch("/dsh-team/bots", {
           method: "POST",
@@ -5422,6 +5531,21 @@ function createMembersPanel(React, host) {
           )
           const data = await response.json()
           if (alive && Array.isArray(data?.members)) setLive(data.members)
+          // 用户此刻就看着这条私聊：她刚说的话不算未读。
+          // 判据是「当前主视图的会话就是这条私聊的会话」，也就是点头像打开的那条。
+          if (alive && Array.isArray(data?.members) && sessionForRoster !== '') {
+            const watching = data.members.find(
+              (member) => String(member?.privateSessionId ?? '') === sessionForRoster
+                && Number(member?.privateUnread) > 0,
+            )
+            if (watching) {
+              void fetch('/dsh-team/private/read', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ bot: watching.id }),
+              }).catch(() => {})
+            }
+          }
           if (alive && Array.isArray(data?.groups)) setUserGroups(data.groups)
           // 自带 Bot 被删掉了、原本在哪个组：恢复键要出现在那个组的招募条右边。
           if (alive && Array.isArray(data?.removedBuiltins)) setRemovedBuiltins(data.removedBuiltins)
@@ -5531,26 +5655,32 @@ function createMembersPanel(React, host) {
       return () => clearTimeout(timer)
     }, [noSessionHint])
 
-    const openChat = async (member) => {
+    const openChat = async (member, options = {}) => {
       // 单聊一律交给宿主判断：旧会话的根还活着就复用，根停了就新开一条。
       // 面板拿到的 member.sessionId 可能来自昨天那个已经停掉的根会话，
       // 客户端自己拍板去开，就会走到「发消息不可用」。
+      // options.private：走私聊入口——一个 Bot 只有一条私聊，跨主会话复用。
+      const asPrivate = options?.private === true
       let sessionId = ''
+      // 0.7 起的私聊是独立根会话：不走「子会话」地址，直接当普通会话打开。
+      let standalone = false
       // 刚开出来的会话，名册还没刷新，父会话 id 只能从开会话的返回值里拿。
       let openedParent = ''
       // 宿主连身份一起给：开页前写进头像映射，第一帧就是 Bot 自己。
       let openedIdentity
       setNoSessionHint(member?.id ?? null)
-      setNotice(`正在打开 ${member?.name || member?.id} 的会话…`)
+      setNotice(`正在打开 ${member?.name || member?.id} 的${asPrivate ? '私聊' : '会话'}…`)
       try {
-        const response = await fetch('/dsh-team/open', {
+        const response = await fetch(asPrivate ? '/dsh-team/private/open' : '/dsh-team/open', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            bot: member?.id,
-            sessionId: sessionForRoster,
-            chatSessionId: member?.sessionId ?? '',
-          }),
+          body: JSON.stringify(asPrivate
+            ? { bot: member?.id, sessionId: sessionForRoster, reopen: false }
+            : {
+                bot: member?.id,
+                sessionId: sessionForRoster,
+                chatSessionId: member?.sessionId ?? '',
+              }),
         })
         const data = await response.json()
         if (!data?.ok) {
@@ -5561,6 +5691,15 @@ function createMembersPanel(React, host) {
         sessionId = data.sessionId
         openedParent = String(data.parentSessionId ?? '')
         openedIdentity = data.identity
+        standalone = data?.standalone === true
+        // 点进来就算读过了：红点清掉，别让它一直挂着。
+        if (asPrivate) {
+          void fetch('/dsh-team/private/read', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ bot: member?.id }),
+          }).catch(() => {})
+        }
         setNotice('')
       } catch (error) {
         setNotice(`开会话失败：${error?.message ?? error}`)
@@ -5585,6 +5724,19 @@ function createMembersPanel(React, host) {
       }
 
       const sidebar = service('sidebarRight')
+      // 私聊是根会话：它就是一条普通会话，交给主视图打开，
+      // 这样左侧会话列表里也有它（子会话地址只会开成一栏聊天，不进列表）。
+      if (standalone) {
+        stampTeamIdentity(sessionId, openedIdentity)
+        const workspace = service('uiWorkspace')
+        if (!workspace || typeof workspace.openSession !== 'function') {
+          setNotice('这个版本打不开普通会话')
+          return
+        }
+        workspace.openSession(sessionId)
+        void publishTeamIdentity(true)
+        return
+      }
       if (!sidebar || typeof sidebar.openResource !== 'function') {
         setNotice('这个版本没有右侧栏接口，打不开会话')
         return
@@ -5965,8 +6117,11 @@ function createMembersPanel(React, host) {
                   h(PanelMemberCard, {
                     member,
                     hint: noSessionHint === member.id,
-                    onOpen: (target) => openChat(target),
-                    onOpenSession: openChat,
+                    // 点卡片：这个会话里派过她 → 进工作聊天；没派过 → 进私聊。
+                    onOpen: (target) => (target?.worked ? openChat(target) : openChat(target, { private: true })),
+                    onOpenSession: (target) => (target?.worked ? openChat(target) : openChat(target, { private: true })),
+                    // 点头像：不管派没派过活，都进私聊。
+                    onOpenPrivate: (target) => openChat(target, { private: true }),
                     onOpenMailbox: (target) => setMailboxBot(target),
                     onSettings: (target) => setInlineEdit((current) => (current === target?.id ? null : target?.id)),
                     onPromote: (target) => setPromoteBot(target),
@@ -6000,6 +6155,7 @@ function createMembersPanel(React, host) {
                       ? h(RecruitInline, {
                           groupId: group.id ?? '',
                           groupName: group.meta.label,
+                          sessionId: sessionForRoster,
                           onDone: (bot) => {
                             setRecruitKey(null)
                             if (bot) setRevision((value) => value + 1)

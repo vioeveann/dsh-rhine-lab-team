@@ -8,7 +8,7 @@ import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { adoptSoulFile, migratePersona, saveBot, stripSoulPlaceholder } from '../host/bots.js'
-import { installChildDecoration } from '../host/tools.js'
+import { installChildDecoration, registerTeamTools } from '../host/tools.js'
 
 async function emptyRoot() {
   const root = await mkdtemp(join(tmpdir(), 'dsh-team-persona-'))
@@ -84,7 +84,12 @@ test('装饰子会话时只注入 soul.txt，不再读 JSON 里的 persona', asy
     session: { header: { id: childId, parentSession: 'session-lead' }, append() {} },
     ctx: {
       on() { return () => {} },
-      systemPrompt: { section: (section) => { sections.push(section); return () => {} } },
+      systemPrompt: {
+        section: (section) => {
+          sections.push({ ...section, text: typeof section.text === 'function' ? section.text() : section.text })
+          return () => {}
+        },
+      },
       tools: { restrict() {} },
     },
   }
@@ -114,6 +119,77 @@ test('装饰子会话时只注入 soul.txt，不再读 JSON 里的 persona', asy
   assert.ok(scope.order > persona.order, '会话范围段必须排在人设段后面')
   assert.match(scope.text, /AGENTS\.md/)
   assert.match(scope.text, /以本段为准/)
+})
+
+test('改完 soul.txt 后，人设段不用重挂也会换成新文本（热更新）', async () => {
+  const root = await emptyRoot()
+  const dir = join(root, 'bots', 'nova', 'memory')
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, 'soul.txt'), '# Nova\n\n旧人设：只做核对。\n', 'utf8')
+  await writeFile(join(root, 'bots', 'nova.json'), JSON.stringify({ id: 'nova', name: 'Nova', role: '研究员' }), 'utf8')
+
+  const sections = []
+  const handlers = new Map()
+  const childId = 'session-child-hot'
+  const agent = {
+    id: childId,
+    session: { header: { id: childId, parentSession: 'session-lead' }, append() {} },
+    ctx: {
+      on() {
+        return () => {}
+      },
+      systemPrompt: {
+        section(section) {
+          const raw = typeof section.text === 'function' ? section.text : () => section.text
+          sections.push({ ...section, text: raw(), raw })
+          return () => {}
+        },
+      },
+      tools: { restrict() {}, definitions: () => [] },
+    },
+  }
+  installChildDecoration(
+    { on(name, fn) { handlers.set(name, fn); return () => {} }, effect() {}, get() { return undefined } },
+    {
+      debug: async () => {},
+      pending: new Map([[childId, { bot: { id: 'nova', name: 'Nova', role: '研究员' }, taskDir: root }]]),
+      tasks: new Map(),
+      persistTasks: async () => {},
+      root,
+    },
+  )
+  await handlers.get('agent/created')({ agent })
+
+  const persona = sections.find((section) => section.name === 'dsh-team/persona')
+  assert.ok(persona, '没注入人设段')
+  // 人设段的 text 必须是取值函数：空闲会话挂不了新段，只能靠它现取。
+  assert.equal(typeof persona.raw, 'function')
+  assert.match(persona.raw(), /旧人设/)
+
+  await writeFile(join(dir, 'soul.txt'), '# Nova\n\n新人设：先问文种，再动笔。\n', 'utf8')
+  const api = {}
+  registerTeamTools(
+    { get: () => undefined, on: () => () => {}, effect: () => () => {} },
+    {
+      api,
+      root,
+      tools: { register: () => () => {} },
+      agents: { get: () => undefined, list: () => [] },
+      subagents: { rootOf: () => null },
+      debug: async () => {},
+      pending: new Map(),
+      tasks: new Map(),
+      persistTasks: async () => {},
+      deliverableRoot: root,
+      getDeliverableRoot: () => root,
+      getSettings: () => ({ maxConcurrent: 2, taskTimeoutSec: 600 }),
+      isTeamSession: () => true,
+    },
+  )
+  const result = await api.refreshPersona('nova')
+  assert.equal(result.ok, true)
+  assert.match(persona.raw(), /新人设/)
+  assert.doesNotMatch(persona.raw(), /旧人设/)
 })
 
 test('占位句下面接着写的人设不会被丢掉：只丢占位那一行和抬头', async () => {

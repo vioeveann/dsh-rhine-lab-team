@@ -10,7 +10,7 @@
  * This module is imported with a cache-busting query by `index.js`, so editing
  * it and toggling the bundle is enough to pick up a change.
  */
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createWorkspaceGuard } from './guard.js'
@@ -20,6 +20,8 @@ import { loadSettings, resolveDeliverableRoot, saveSettings } from './settings.j
 import { createUsageBook } from './usage.js'
 import { createMailbox } from './mailbox.js'
 import { migrateDataRoot, resolveDataRoot } from './paths.js'
+import { privateEntryOf, readPrivateState } from './private-chat.js'
+import { createPersonaWatcher } from './persona-watch.js'
 /**
  * 工具层和面板路由这两块改得最勤，所以带缓存戳动态 import：
  * 静态 import 会命中 ESM 模块缓存，改完翻开关也不会重新加载，只能重启 DSH。
@@ -52,6 +54,12 @@ const DELIVERABLES = resolveDeliverableRoot(ROOT, SETTINGS, process.env.DSH_TEAM
 
 /** 工具层与 HTTP 路由共享的钩子（例如面板上的「重试」）。 */
 const TEAM_API = {}
+/**
+ * 人设段的撤换句柄，按子会话 id 存。
+ * 用户改完 soul.txt，靠这张表把「已经在跑的会话」下一轮就换上新设定，
+ * 不用关了重开。
+ */
+const personas = new Map()
 const DEBUG_LOG = join(DEBUG_DIR, 'host.log')
 
 /** Children waiting to be decorated, keyed by the session id we reserved. */
@@ -244,7 +252,16 @@ export async function apply(ctx, config = {}) {
   try {
     await loadUsage()
     await claimInstance()
-    const dispose = installChildDecoration(ctx, { debug, pending, tasks, persistTasks, root: ROOT, usageBook: usage })
+    const dispose = installChildDecoration(ctx, {
+      debug,
+      pending,
+      tasks,
+      persistTasks,
+      root: ROOT,
+      usageBook: usage,
+      personas,
+      api: TEAM_API,
+    })
 
     // 秘书也要读团队知识库，不然它不知道 Bot 知道什么。
     // 注册返回的 disposer 必须挂到 effect 清理上，否则重载时旧段落还在，
@@ -290,6 +307,55 @@ export async function apply(ctx, config = {}) {
     await debug({ event: 'listener', ok: false, error: String(error?.message ?? error) })
   }
 
+  // 人设热更新：只在用户点「编辑人设」之后开一个 30 分钟窗口盯着 soul.txt。
+  // 文件一变，就把正在跑的会话里的设定段整段换掉——不关会话、不重开。
+  let personaWatch = null
+  try {
+    personaWatch = createPersonaWatcher({
+      debug,
+      onChanged: async (botId) => {
+        const result = await TEAM_API.refreshPersona?.(botId)
+        await debug({ event: 'persona-refresh', bot: botId, refreshed: result?.refreshed ?? 0, ok: Boolean(result?.ok) })
+        // 私聊那条线也立刻照新设定说话，不然用户改完人设、私聊里还是老腔调。
+        try {
+          const state = await readPrivateState(ROOT)
+          const entry = privateEntryOf(state, botId)
+          const agents = ctx.get('agents')
+          // 0.7 的私聊是根会话，没有父代理可走 subagents.sendMessage，
+          // 只能让宿主直接往那个会话里推一句。
+          if (entry?.kind === 'private' && typeof TEAM_API.nudgePrivate === 'function') {
+            const nudged = await TEAM_API.nudgePrivate({
+              botId,
+              text: '（设定已经更新了。按新的设定重新来一遍，一两句打个招呼就好。）',
+            })
+            await debug({ event: 'persona-nudge', bot: botId, ok: Boolean(nudged?.ok) })
+            return
+          }
+          if (!entry?.sessionId) {
+            // 还没私聊过：借当前这个会话当父会话，起一条私聊让它照新人设打个招呼。
+            // 拿不到活着的根会话就只换热更新，等他点头像再说。
+            const live = typeof agents?.list === 'function' ? agents.list() : []
+            const rootAgent = live.find((agent) => {
+              const header = agent?.session?.header ?? {}
+              return !header.parentSession && typeof header.id === 'string' && header.id !== ''
+            })
+            const parentSession = rootAgent?.session?.header?.id ?? ''
+            if (parentSession !== '' && typeof TEAM_API.openPrivate === 'function') {
+              await TEAM_API.openPrivate({ botId, parentSession })
+              await debug({ event: 'persona-greeting', bot: botId, ok: true })
+            }
+            return
+          }
+        } catch (error) {
+          await debug({ event: 'persona-nudge', bot: botId, ok: false, error: String(error?.message ?? error) })
+        }
+      },
+    })
+    ctx.effect(() => () => personaWatch?.dispose?.())
+  } catch (error) {
+    await debug({ event: 'persona-watch', ok: false, error: String(error?.message ?? error) })
+  }
+
   let teamMode
   try {
     teamMode = installTeamMode(ctx, {
@@ -300,6 +366,8 @@ export async function apply(ctx, config = {}) {
       api: TEAM_API,
       persistTasks,
       getRoster: ({ sessionId }) => readRoster({ root: ROOT, tasks, sessionId, mailbox }),
+      // 点「编辑人设」时开窗，盯一会儿文件有没有变。
+      armPersona: (botId, file) => personaWatch?.arm?.(botId, file),
       getInstanceConflict: () => instanceConflict,
       // 面板里的「模型」要能列出真正可调用的模型，而不是让人手填。
       getModels: async () => {
@@ -366,8 +434,11 @@ export async function apply(ctx, config = {}) {
       persistTasks,
 
       isTeamSession: (sessionId) => Boolean(teamMode?.isEnabled?.(sessionId)),
+      personas,
     })
     ctx.effect(() => disposeTools)
+    // 启动扫一遍：早期删掉的 Bot 还留着私聊会话的那份，现在归档收起来。
+    void TEAM_API?.prunePrivateSessions?.().catch(() => {})
     const disposeGuard = tools.guard(createWorkspaceGuard({ tasks, deliverableRoot: DELIVERABLES }))
     ctx.effect(() => disposeGuard)
     const disposeMemory = registerMemoryTools(ctx, { root: ROOT, tools, debug, pending })

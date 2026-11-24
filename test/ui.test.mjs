@@ -79,7 +79,7 @@ const byLabel = (label) => (node) => node.props?.['aria-label'] === label
 const byText = (text) => (node) => (node.children ?? []).includes(text)
 
 /** 装一个客户端实例：fetch 记账、侧栏服务记账。 */
-async function loadClient({ members = [] } = {}) {
+async function loadClient({ members = [], seedIdentity = null } = {}) {
   const source = await readFile(join(here, '..', 'client.js'), 'utf8')
   const react = fakeReact()
   const registrations = []
@@ -87,11 +87,18 @@ async function loadClient({ members = [] } = {}) {
   const sidebarCalls = []
 
   let captured
+  // 头像映射写在 localStorage 里：真存一份，测试才看得到写了什么。
+  const storage = new Map()
+  if (seedIdentity !== null) storage.set('dsh-team:identity/v1', JSON.stringify(seedIdentity))
   const window = {
     addEventListener: () => {},
     removeEventListener: () => {},
     dispatchEvent: () => {},
-    localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+    localStorage: {
+      getItem: (key) => (storage.has(key) ? storage.get(key) : null),
+      setItem: (key, value) => storage.set(key, String(value)),
+      removeItem: (key) => storage.delete(key),
+    },
     __ModuleLoader__: {
       load(definition) { captured = definition },
     },
@@ -126,6 +133,8 @@ async function loadClient({ members = [] } = {}) {
   globalThis.setInterval = () => ({ unref() {} })
   globalThis.localStorage = window.localStorage
   globalThis.fetch = fetchStub
+  // 头像映射的同步挂在 window.fetch 上：不给的话那段直接跳过，测不到。
+  window.fetch = fetchStub
   globalThis.window = window
 
   // eslint-disable-next-line no-new-func
@@ -148,7 +157,7 @@ async function loadClient({ members = [] } = {}) {
   assert.ok(panel, '成员面板没注册')
   assert.ok(toggle, '团队协作开关没注册')
 
-  return { react, panel, toggle, calls, sidebarCalls, members, registrations }
+  return { react, panel, toggle, calls, sidebarCalls, members, registrations, storage }
 }
 
 /** 渲染面板并跑一次挂载 effect。 */
@@ -258,6 +267,8 @@ test('成员卡点一下会去开它的会话', async () => {
       teaches: 0,
       tasks: 0,
       group: '',
+      // 这个会话里派过活：点卡片进工作聊天。
+      worked: true,
     }],
   })
   const tree = mountPanel(harness)
@@ -272,4 +283,84 @@ test('成员卡点一下会去开它的会话', async () => {
     harness.calls.some((call) => call.url.includes('/dsh-team/open')),
     '点卡片没有去开会话',
   )
+})
+
+test('没派过活的成员，点卡片进私聊', async () => {
+  const harness = await loadClient({
+    members: [{
+      id: 'nova',
+      name: 'Nova',
+      role: '研究员',
+      status: 'idle',
+      rank: 0,
+      lv: 1,
+      stars: 0,
+      teaches: 0,
+      tasks: 0,
+      group: '',
+      worked: false,
+      privateUnread: 2,
+    }],
+  })
+  const tree = mountPanel(harness)
+  await flush()
+
+  const card = find(tree, (node) => node.props?.['data-dsh-team-member'] === 'nova')
+  assert.ok(card, '成员卡没渲染出来')
+  card.props.onClick()
+  await flush()
+
+  const urls = harness.calls.map((call) => call.url)
+  assert.ok(
+    urls.some((url) => url.includes('/dsh-team/private/open')),
+    '没派过活时点卡片应该进私聊',
+  )
+  // 点进来就算读过：红点清掉。
+  assert.ok(
+    urls.some((url) => url.includes('/dsh-team/private/read')),
+    '进私聊后应该把未读清掉',
+  )
+})
+
+test('私聊会话也写进头像映射：账本里没有它，按名册补', async () => {
+  const harness = await loadClient({
+    members: [{
+      id: 'nova',
+      name: 'Nova',
+      role: '研究员',
+      status: 'idle',
+      worked: false,
+      privateSessionId: 'session-private-1',
+      privateUnread: 0,
+    }],
+  })
+  await flush()
+
+  const raw = harness.storage.get('dsh-team:identity/v1')
+  assert.ok(raw, '没有写出头像映射')
+  const map = JSON.parse(raw)
+  assert.equal(map['session-private-1']?.id, 'nova', '私聊会话没有对到 Bot')
+  assert.equal(map['session-private-1']?.name, 'Nova')
+})
+
+test('已经写进去的映射不会被账本重拼冲掉', async () => {
+  // 面板刚点开时会先 stamp 一条进去，随后 publishTeamIdentity(force) 整体重写：
+  // 起点必须带上已有那份，否则刚写的那条立刻被冲掉，头像回落成主会话的。
+  const harness = await loadClient({
+    seedIdentity: {
+      'session-manual-9': { id: 'nova', name: '手工写进去的名字', src: '/dsh-team/avatar?bot=nova&v=3', onOpen: true, speech: false },
+    },
+    members: [{
+      id: 'nova',
+      name: 'Nova',
+      role: '研究员',
+      status: 'idle',
+      worked: false,
+      privateUnread: 0,
+    }],
+  })
+  await flush()
+
+  const map = JSON.parse(harness.storage.get('dsh-team:identity/v1'))
+  assert.equal(map['session-manual-9']?.name, '手工写进去的名字', '重拼之后已有的身份被冲掉了')
 })
