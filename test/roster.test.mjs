@@ -1,12 +1,16 @@
 /**
  * Roster merge: disk defines who exists, the live task map decides who is busy.
  */
-import { test } from 'node:test'
+import { beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readRoster } from '../host/team-mode.js'
+import { resetChildStates } from '../host/live-watch.js'
+
+// 实时登记是进程级的；同一个进程里别的用例可能留下「在跑」的会话，先把现场清干净。
+beforeEach(() => resetChildStates())
 
 /** Build a throwaway package root with one bot. */
 async function fixture() {

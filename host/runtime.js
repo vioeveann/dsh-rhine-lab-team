@@ -13,15 +13,28 @@
 import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { installChildDecoration, readTeamMemory, registerMemoryTools, registerTeamTools, SECRETARY_RULES } from './tools.js'
 import { createWorkspaceGuard } from './guard.js'
 import { adoptSoulFile, loadBots, migratePersona } from './bots.js'
 import { ensureBuiltinBots } from './builtin-bots.js'
-import { installTeamMode, readRoster } from './team-mode.js'
 import { loadSettings, resolveDeliverableRoot, saveSettings } from './settings.js'
 import { createUsageBook } from './usage.js'
 import { createMailbox } from './mailbox.js'
 import { migrateDataRoot, resolveDataRoot } from './paths.js'
+/**
+ * 工具层和面板路由这两块改得最勤，所以带缓存戳动态 import：
+ * 静态 import 会命中 ESM 模块缓存，改完翻开关也不会重新加载，只能重启 DSH。
+ * 里面的 ./bots.js 之类仍是普通 import——它们没改，共用一份就行。
+ */
+const toolsModule = await import(`./tools.js?v=${Date.now()}`)
+const teamModeModule = await import(`./team-mode.js?v=${Date.now()}`)
+const {
+  installChildDecoration,
+  readTeamMemory,
+  registerMemoryTools,
+  registerTeamTools,
+  SECRETARY_RULES,
+} = toolsModule
+const { installTeamMode, readRoster } = teamModeModule
 
 /** 插件包目录：只放代码，不放数据。升级时它会被整个替换。 */
 const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url))
@@ -378,7 +391,8 @@ export async function apply(ctx, config = {}) {
         let pluginVersion = ''
         let dshEngine = ''
         try {
-          const pkg = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8'))
+          // 版本号在包目录里，不在数据目录里——以前读错了地方，体检报告永远是空的。
+          const pkg = JSON.parse(await readFile(join(PACKAGE_ROOT, 'package.json'), 'utf8'))
           pluginVersion = String(pkg.version ?? '')
           dshEngine = String(pkg.engines?.dsh ?? '')
         } catch {

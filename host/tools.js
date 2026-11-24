@@ -34,6 +34,7 @@ import { growthDetail, growthSummary, promote, regrade, settleRepeat, settleTask
 import { taskGain } from './progress.js'
 import { loadBots, stripSoulPlaceholder } from './bots.js'
 import { formatMailPrompt } from './mailbox.js'
+import { forgetChild, noteChildState } from './live-watch.js'
 
 /** 插件自带审计员的 id；打 excellent 前必须先有它的审计记录。 */
 const AUDITOR_ID = 'auditor'
@@ -1320,6 +1321,94 @@ export function registerTeamTools(ctx, options) {
     return bot
   }
 
+  /**
+   * 派活那次调用被中止（秘书正等结果时用户插话）后，子会话其实还在后台跑。
+   * 这里接力盯它：每 3 秒看一眼落盘会话有没有新的 turn/end，等到就把账本收成
+   * ready、推一张卡片，再让这个 Bot 的子会话给秘书发一条消息把秘书叫醒。
+   * 只读不打断——它在干活，别去碰它。
+   */
+  function watchDetachedTask({ taskId, bot, sessionId, startedAt, exec }) {
+    const deadline = Date.now() + 4 * 60 * 60 * 1000
+    let ticking = false
+    const timer = setInterval(async () => {
+      if (ticking) return
+      ticking = true
+      try {
+        const row = tasks?.get(taskId)
+        if (!row || !row.detached || row.status !== 'running') {
+          clearInterval(timer)
+          return
+        }
+        if (Date.now() > deadline) {
+          row.status = 'timeout'
+          row.doneAt = Date.now()
+          row.note = '派活调用被中断后一直没等到这一轮说完，后台接力放弃'
+          delete row.detached
+          forgetChild(sessionId)
+          void persistTasks?.()
+          options.api?.broadcast?.({ type: 'tasks' })
+          void debug?.({ event: 'detached-timeout', taskId, bot: bot.id })
+          clearInterval(timer)
+          return
+        }
+        const text = await readSessionTurnReply(sessionId, startedAt)
+        if (!text) return
+        const usage = usageBook?.take?.(sessionId)
+        if (usage) row.tokens = usage
+        row.status = 'ready'
+        row.doneAt = Date.now()
+        row.output = text.slice(0, 4000)
+        row.note = '派活调用被中断，这一轮结果是后台接力补记的'
+        delete row.detached
+        forgetChild(sessionId)
+        void persistTasks?.()
+        options.api?.broadcast?.({ type: 'tasks' })
+        options.api?.broadcast?.({
+          type: 'task-done',
+          taskId,
+          bot: bot.id,
+          status: 'ready',
+          text: text.slice(0, 600),
+        })
+        void maybeQueueReview(row, exec)
+        void debug?.({ event: 'detached-finish', taskId, bot: bot.id, bytes: text.length })
+        // 账本变了不会自己开一轮，所以让子会话给秘书发一条消息，把秘书叫醒。
+        // sendMessage 不允许自己发给自己，发送方必须是那个子会话本身。
+        try {
+          const child = liveChildren.get(sessionId)
+          if (child && row.parentSession && subagents?.sendMessage) {
+            await subagents.sendMessage(
+              child,
+              row.parentSession,
+              [
+                {
+                  type: 'text',
+                  text: `【团队】${bot.name ?? bot.id} 的 ${taskId} 已经干完（派活调用被中断，这条是后台补报的）：\n${String(text).slice(0, 800)}`,
+                },
+              ],
+              { signal: new AbortController().signal },
+            )
+            void debug?.({ event: 'detached-notify', taskId, ok: true })
+          } else {
+            void debug?.({
+              event: 'detached-notify',
+              taskId,
+              ok: false,
+              reason: child ? 'no-parent' : 'no-child',
+            })
+          }
+        } catch (error) {
+          void debug?.({ event: 'detached-notify', taskId, ok: false, error: String(error?.message ?? error) })
+        }
+        clearInterval(timer)
+      } finally {
+        ticking = false
+      }
+    }, 3000)
+    // 别让这个定时器把进程钉住。
+    timer.unref?.()
+  }
+
   const reviewQueued = new Set()
 
   // 有交付物的任务完成后，自动给它建一张审计子任务；终审仍由秘书做。
@@ -2182,26 +2271,54 @@ export function registerTeamTools(ctx, options) {
           const usage = usageBook?.take?.(started?.childId ?? childId)
           if (usage) entry.tokens = usage
         }
-        // 只把「还在跑」的行收成 ready：失败 / 超时 / 取消已经写过自己的状态，别覆盖。
-        if (entry && (!entry.status || entry.status === 'running')) {
-          entry.doneAt = Date.now()
-          entry.status = 'ready'
-        } else if (entry && !entry.doneAt) {
-          entry.doneAt = Date.now()
-        }
-        // 留下这一轮的回复：返工续聊时用来判断「这是不是新回复」。
-        if (entry && finalText !== '') entry.output = finalText.slice(0, 4000)
-        void persistTasks?.()
-        // 干完就推一张实时卡片：不等秘书收尾再贴。
-        if (entry?.status === 'ready') void maybeQueueReview(entry, exec)
-        if (entry) {
-          options.api?.broadcast?.({
-            type: 'task-done',
+        const interrupted = exec?.signal?.aborted === true
+        const stillRunning = Boolean(entry) && (!entry.status || entry.status === 'running')
+        // 用户在秘书等结果时插话 → 这一次工具调用被判 aborted，但子会话没停。
+        // 这时候不能把账本收成 ready：成员卡会显示「待命」，看门狗也跟着关掉。
+        // 保留 running，交给后台接力，等这一轮真说完再收。
+        if (entry && interrupted && stillRunning) {
+          entry.detached = true
+          entry.status = 'running'
+          delete entry.doneAt
+          void persistTasks?.()
+          options.api?.broadcast?.({ type: 'tasks' })
+          void debug?.({
+            event: 'dispatch-interrupted',
             taskId,
             bot: bot.id,
-            status: entry.status,
-            text: String(entry.output ?? entry.note ?? '').slice(0, 600),
+            sessionId: started?.childId ?? childId,
           })
+          watchDetachedTask({
+            taskId,
+            bot,
+            sessionId: started?.childId ?? childId,
+            startedAt: entry.startedAt ?? Date.now(),
+            exec,
+          })
+        } else {
+          // 只把「还在跑」的行收成 ready：失败 / 超时 / 取消已经写过自己的状态，别覆盖。
+          if (entry && (!entry.status || entry.status === 'running')) {
+            entry.doneAt = Date.now()
+            entry.status = 'ready'
+          } else if (entry && !entry.doneAt) {
+            entry.doneAt = Date.now()
+          }
+          // 留下这一轮的回复：返工续聊时用来判断「这是不是新回复」。
+          if (entry && finalText !== '') entry.output = finalText.slice(0, 4000)
+          // 这一趟收了尾，实时登记也撤掉，别让它一直算在「在干活」里。
+          forgetChild(started?.childId ?? childId)
+          void persistTasks?.()
+          // 干完就推一张实时卡片：不等秘书收尾再贴。
+          if (entry?.status === 'ready') void maybeQueueReview(entry, exec)
+          if (entry) {
+            options.api?.broadcast?.({
+              type: 'task-done',
+              taskId,
+              bot: bot.id,
+              status: entry.status,
+              text: String(entry.output ?? entry.note ?? '').slice(0, 600),
+            })
+          }
         }
       }
       }
@@ -4228,7 +4345,21 @@ export function installChildDecoration(ctx, options) {
     })
     pending.delete(header.id)
     // 恢复出来的子会话进这里：续聊等回复时 agents.get 可能拿不到它。
-    if (hit) liveChildren.set(header.id, agent)
+    if (hit) {
+      liveChildren.set(header.id, agent)
+      // 面板的「在不在干活」以子会话自己报的状态为准：账本那行可能因为派活调用
+      // 被中止而提前收成 ready，只认账本就会出现「人在干活、卡上写待命」。
+      try {
+        const botId = hit.bot?.id
+        noteChildState(header.id, 'running', botId)
+        agent.ctx.on('agent/status', (event) => {
+          const state = typeof event === 'string' ? event : event?.status
+          noteChildState(header.id, state, botId)
+        })
+      } catch (error) {
+        void debug?.({ event: 'live-watch-failed', error: String(error?.message ?? error) })
+      }
+    }
     if (!hit) {
       // 没有派活记录也不一定是普通会话：根会话就是秘书，它也要知道知识库。
       if (!header.parentSession) {

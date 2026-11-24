@@ -19,6 +19,7 @@ import { growthSummary, normalizeGrowth } from './growth.js'
 import { sumTaskTokens } from './usage.js'
 import { updateGrowth } from './growth-store.js'
 import { commitMemory } from './memory.js'
+import { runningBots } from './live-watch.js'
 
 const SWITCH_ROUTE = '/dsh-team/team-mode'
 const ROSTER_ROUTE = '/dsh-team/roster'
@@ -387,6 +388,9 @@ export function installTeamMode(ctx, options) {
           .map((entry) => ({
             taskId: entry.taskId,
             bot: entry.bot,
+            // 客户端要按「子会话 → Bot」拼头像映射：这条不发，头像就只能靠
+            // identity-map 那条路由，一旦它没注册上，新会话就顶主会话的脸。
+            sessionId: entry.sessionId ?? '',
             status: entry.status ?? 'running',
             startedAt: entry.startedAt ?? null,
             doneAt: entry.doneAt ?? null,
@@ -1596,6 +1600,8 @@ export function installTeamMode(ctx, options) {
         disposeImportBot,
         disposeImportBotFiles,
         disposeQuickstart,
+        disposeIdentityMap,
+        disposeSessionBot,
       ]) {
         try {
           dispose?.()
@@ -1691,11 +1697,14 @@ export async function readRoster(options) {
       continue
     }
     const running = live.get(bot.id) ?? []
+    // 账本里的 running 只在派活那一次调用没被打断时才可靠；被打断时账本被提前收成
+    // ready，子会话却还在跑，面板就会误显示「待命」。所以再看一眼子会话自己报的状态。
+    const busyNow = runningBots()
     members.push({
       id: bot.id,
       name: bot.name ?? bot.id,
       role: bot.role ?? '',
-      status: bot.status === 'disabled' ? 'disabled' : running.length > 0 ? 'busy' : 'idle',
+      status: bot.status === 'disabled' ? 'disabled' : running.length > 0 || busyNow.has(bot.id) ? 'busy' : 'idle',
       group: bot.group ?? '',
       stars: bot.stars ?? 0,
       // 插件自带的 Bot；limited 表示「限定」（带标签、删了能恢复）。

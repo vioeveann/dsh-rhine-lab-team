@@ -739,7 +739,7 @@ window.__ModuleLoader__.load({
 const MEMBERS_TAB_ID = 'dsh-team/members'
 
 /** 每次改客户端都改这个戳，用来判断页面拿到的是不是新 bundle。 */
-const BUILD_STAMP = 'a15'
+const BUILD_STAMP = 'a16'
 
 /**
  * 把「子会话 → Bot」的映射发布给 dsh-avatar-frame：
@@ -770,9 +770,30 @@ let lastIdentityRaw = null
 async function publishTeamIdentity(force = false) {
   try {
     // 账本全量：每个子会话都能对上 Bot（不只每个 Bot 的最近一次）。
-    const response = await fetch('/dsh-team/identity-map')
-    const data = await response.json()
-    const map = data?.map ?? {}
+    // 映射现拼自 tasks + roster，identity-map 只作为补充：那条路由曾经因为
+    // 重载时漏撤而由旧实例一直供着，数据停在重载那一刻，新会话全漏。
+    const [identity, list, roster] = await Promise.all([
+      fetch('/dsh-team/identity-map').then((response) => (response.ok ? response.json() : null)).catch(() => null),
+      fetch('/dsh-team/tasks').then((response) => (response.ok ? response.json() : null)).catch(() => null),
+      fetch('/dsh-team/roster').then((response) => (response.ok ? response.json() : null)).catch(() => null),
+    ])
+    const map = { ...(identity?.map ?? {}) }
+    const names = new Map()
+    for (const member of roster?.members ?? []) {
+      if (member?.id) names.set(String(member.id), member.name ?? member.id)
+    }
+    for (const task of list?.tasks ?? []) {
+      const sessionId = String(task?.sessionId ?? '').trim()
+      const bot = String(task?.bot ?? '').trim()
+      if (sessionId === '' || bot === '') continue
+      map[sessionId] = {
+        id: bot,
+        name: names.get(bot) ?? bot,
+        src: `/dsh-team/avatar?bot=${encodeURIComponent(bot)}&v=3`,
+        onOpen: true,
+        speech: false,
+      }
+    }
     const raw = JSON.stringify(map)
     if (!force && raw === lastIdentityRaw) return
     lastIdentityRaw = raw
