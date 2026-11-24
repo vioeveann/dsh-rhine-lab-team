@@ -207,6 +207,15 @@ export function installTeamMode(ctx, options) {
   const { root, debug, tasks, mailbox, getRoster, getSettings, saveSettings, api, persistTasks, getModels, getInstanceConflict } = options
   const storeFile = join(root, '.state', 'team-mode.json')
 
+  // 热重载时旧模块的 disposer 可能没跑到，路由会撞 duplicate exact route。
+  // 在进程级留一个上一份安装的清理函数，新的一份安装前先撤旧的。
+  const ROUTE_OWNER = Symbol.for('dsh-rhine-lab-team.team-mode.dispose')
+  try {
+    globalThis[ROUTE_OWNER]?.()
+  } catch {
+    // 旧模块已经撤过或参数不兼容，继续装新的
+  }
+
   /** 在线的 SSE 客户端。 */
   const eventClients = new Set()
 
@@ -1117,6 +1126,7 @@ export function installTeamMode(ctx, options) {
         const result = await api?.openChat?.({
           botId: String(body.bot ?? ''),
           parentSession: String(body.sessionId ?? ''),
+          chatSessionId: String(body.chatSessionId ?? ''),
         })
         json(res, 200, result ?? { ok: false, error: '单聊接口没接上' })
       } catch (error) {
@@ -1590,9 +1600,7 @@ export function installTeamMode(ctx, options) {
     },
   })
 
-  return {
-    isEnabled: (sessionId) => state.get(String(sessionId)) === true,
-    dispose: () => {
+  const disposeAll = () => {
       // 新加的路由也要撤；漏一个，下次重载就会撞「duplicate exact route」。
       for (const dispose of [
         disposeExportPack,
@@ -1641,6 +1649,19 @@ export function installTeamMode(ctx, options) {
       disposeAvatar()
       disposeMemoryRoute()
       disposePersona()
+  }
+  globalThis[ROUTE_OWNER] = disposeAll
+  return {
+    isEnabled: (sessionId) => state.get(String(sessionId)) === true,
+    dispose: () => {
+      if (globalThis[ROUTE_OWNER] === disposeAll) {
+        try {
+          delete globalThis[ROUTE_OWNER]
+        } catch {
+          // 删不掉也不影响
+        }
+      }
+      disposeAll()
     },
   }
 }

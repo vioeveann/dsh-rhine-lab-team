@@ -33,6 +33,7 @@ import { confirmImprovement, promoteBot, savePromotionSpeech, updateGrowth } fro
 import { growthDetail, growthSummary, promote, regrade, settleRepeat, settleTask, settleTeaching } from './growth.js'
 import { taskGain } from './progress.js'
 import { loadBots, stripSoulPlaceholder } from './bots.js'
+import { chatRootAlive } from './chat-session.js'
 import { formatMailPrompt } from './mailbox.js'
 import { forgetChild, noteChildState } from './live-watch.js'
 
@@ -4031,18 +4032,73 @@ export function registerTeamTools(ctx, options) {
       }
     }
 
-    // 给没有会话的 Bot 开一个单聊：起个子会话，让它只问一句好，然后等你说话。
-    options.api.openChat = async ({ botId, parentSession }) => {
+    // 给 Bot 开单聊；已有会话还活着的就复用，根会话死了就重开一条。
+    //
+    // DSH 的硬约束：往子会话发消息时，它的根会话必须活着；创建者可以离线。
+    // 所以按根会话判断，不按 parentSession 判断——旧单聊的根一旦停了，
+    // 这条会话就发不出消息，只能新开，并把旧账本留作记录。
+    const chatIdentityOf = (bot) => ({
+      id: bot.id,
+      name: bot.name ?? bot.id,
+      src: `/dsh-team/avatar?bot=${encodeURIComponent(bot.id)}&v=3`,
+      onOpen: true,
+      speech: false,
+    })
+
+    options.api.openChat = async ({ botId, parentSession, chatSessionId }) => {
       const bot = await readBot(root, String(botId ?? '').trim())
       if (!bot) return { ok: false, error: '没有这个 Bot' }
       if (bot.status === 'disabled') return { ok: false, error: '这个 Bot 已停用' }
       const parent = String(parentSession ?? '').trim()
       const parentAgent = parent === '' ? null : agents?.get?.(parent)
       if (!parentAgent) return { ok: false, error: '拿不到当前会话' }
+
+      // 面板点的是已有单聊：先看它的根还活着没有。活着就复用，
+      // 死了就走下面新开一条，用户不需要知道“为什么发不出去”。
+      const requested = String(chatSessionId ?? '').trim()
+      if (requested !== '') {
+        const entry = [...tasks.values()].find(
+          (row) => row.sessionId === requested && row.bot === bot.id,
+        )
+        const alive = entry
+          ? chatRootAlive(entry, {
+              currentSession: parent,
+              getAgent: (id) => agents?.get?.(id),
+            })
+          : false
+        if (alive) {
+          return {
+            ok: true,
+            sessionId: requested,
+            parentSessionId: String(entry?.parentSession ?? parent),
+            identity: chatIdentityOf(bot),
+            bot: bot.id,
+            reused: true,
+          }
+        }
+        if (entry) {
+          await debug?.({
+            event: 'chat-stale',
+            bot: bot.id,
+            sessionId: requested,
+            root: String(entry.rootSession ?? entry.parentSession ?? ''),
+          })
+        }
+      }
+
       const childId = `session-${randomUUID()}`
       const dir = join(root, '.team-work', bot.id, `chat-${Date.now().toString(36)}`)
       await mkdir(dir, { recursive: true })
       pending.set(childId, { bot, taskDir: dir })
+      // 记下创建时所在的根会话：以后判断这条单聊还能不能发消息，就看它。
+      // 拿不到 rootOf 就退回当前会话；当前会话本身一定是活的。
+      let rootSession = parent
+      try {
+        const rootAgent = subagents?.rootOf?.(parentAgent)
+        rootSession = String(rootAgent?.session?.header?.id ?? rootAgent?.id ?? parent)
+      } catch {
+        rootSession = parent
+      }
       const prompt = `主动打开这个会话想和你说话，不是派任务：不要调用任何工具，不要写文件，也不要给自己派活。只回一句「在」，然后等${address()}开口。`
       const base = {
         provider: 'spawn',
@@ -4068,6 +4124,7 @@ export function registerTeamTools(ctx, options) {
           taskId: chatId,
           bot: bot.id,
           parentSession: parent,
+          rootSession,
           cwd: dir,
           startedAt: Date.now(),
           // 这是「入口标记」，不是在跑的活：立刻收尾，免得名册一直显示忙。
@@ -4078,19 +4135,12 @@ export function registerTeamTools(ctx, options) {
         })
         void persistTasks?.()
         options.api?.broadcast?.({ type: 'tasks' })
-        await debug?.({ event: 'chat-open', bot: bot.id, sessionId: childId })
+        await debug?.({ event: 'chat-open', bot: bot.id, sessionId: childId, rootSession })
         // 父会话 id 一起回去：面板拿到就能直接开出「子会话」标签，
         // 不用等名册刷新（等那一下，用户第一次点必然失败）。
         // identity 也一起回去：面板拿它先写进头像映射，第一帧就不会顶着主会话的头像。
         // 字段跟 `/dsh-team/identity-map` 那份保持一致，改的时候两边一起改。
-        const identity = {
-          id: bot.id,
-          name: bot.name ?? bot.id,
-          src: `/dsh-team/avatar?bot=${encodeURIComponent(bot.id)}&v=3`,
-          onOpen: true,
-          speech: false,
-        }
-        return { ok: true, sessionId: childId, parentSessionId: parent, identity, bot: bot.id }
+        return { ok: true, sessionId: childId, parentSessionId: parent, identity: chatIdentityOf(bot), bot: bot.id }
       } catch (error) {
         pending.delete(childId)
         return { ok: false, error: String(error?.message ?? error) }

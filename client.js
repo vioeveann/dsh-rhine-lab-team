@@ -5532,36 +5532,40 @@ function createMembersPanel(React, host) {
     }, [noSessionHint])
 
     const openChat = async (member) => {
-      let sessionId = member?.sessionId
+      // 单聊一律交给宿主判断：旧会话的根还活着就复用，根停了就新开一条。
+      // 面板拿到的 member.sessionId 可能来自昨天那个已经停掉的根会话，
+      // 客户端自己拍板去开，就会走到「发消息不可用」。
+      let sessionId = ''
       // 刚开出来的会话，名册还没刷新，父会话 id 只能从开会话的返回值里拿。
       let openedParent = ''
       // 宿主连身份一起给：开页前写进头像映射，第一帧就是 Bot 自己。
       let openedIdentity
-      if (!sessionId) {
-        // 还没有会话：先开一个单聊会话，再把它打开。
-        setNoSessionHint(member?.id ?? null)
-        setNotice(`正在给 ${member?.name || member?.id} 开会话…`)
-        try {
-          const response = await fetch('/dsh-team/open', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ bot: member?.id, sessionId: sessionForRoster }),
-          })
-          const data = await response.json()
-          if (!data?.ok) {
-            setNotice(data?.error ?? '开会话失败')
-            setNoSessionHint(null)
-            return
-          }
-          sessionId = data.sessionId
-          openedParent = String(data.parentSessionId ?? '')
-          openedIdentity = data.identity
-          setNotice('')
-        } catch (error) {
-          setNotice(`开会话失败：${error?.message ?? error}`)
+      setNoSessionHint(member?.id ?? null)
+      setNotice(`正在打开 ${member?.name || member?.id} 的会话…`)
+      try {
+        const response = await fetch('/dsh-team/open', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            bot: member?.id,
+            sessionId: sessionForRoster,
+            chatSessionId: member?.sessionId ?? '',
+          }),
+        })
+        const data = await response.json()
+        if (!data?.ok) {
+          setNotice(data?.error ?? '开会话失败')
           setNoSessionHint(null)
           return
         }
+        sessionId = data.sessionId
+        openedParent = String(data.parentSessionId ?? '')
+        openedIdentity = data.identity
+        setNotice('')
+      } catch (error) {
+        setNotice(`开会话失败：${error?.message ?? error}`)
+        setNoSessionHint(null)
+        return
       }
       setNoSessionHint(null)
       const service = (name) => {
