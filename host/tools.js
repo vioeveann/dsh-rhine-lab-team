@@ -1472,26 +1472,72 @@ export function registerTeamTools(ctx, options) {
   function watchDetachedTask({ taskId, bot, sessionId, startedAt, exec }) {
     const fallbackDeadline = Date.now() + 4 * 60 * 60 * 1000
     const notifyParent = async (row, text) => {
-      try {
-        const child = liveChildren.get(sessionId) ?? agents?.get?.(sessionId) ?? null
-        if (child && row.parentSession && subagents?.sendMessage) {
+      const target = String(row.parentSession ?? '').trim()
+      if (target === '') {
+        void debug?.({ event: 'detached-notify', taskId, ok: false, reason: 'no-parent' })
+        return
+      }
+      const child = liveChildren.get(sessionId) ?? agents?.get?.(sessionId) ?? null
+      if (child && subagents?.sendMessage) {
+        try {
           await subagents.sendMessage(
             child,
-            row.parentSession,
+            target,
             [{ type: 'text', text }],
             { signal: new AbortController().signal },
           )
-          void debug?.({ event: 'detached-notify', taskId, ok: true })
-        } else {
+          void debug?.({ event: 'detached-notify', taskId, ok: true, via: 'subagents' })
+          return
+        } catch (error) {
+          // 定时器不是「活着的调用者」，sendMessage 会报
+          // "subagent tree access requires the exact live caller"；落到下面直接投话。
           void debug?.({
             event: 'detached-notify',
             taskId,
             ok: false,
-            reason: child ? 'no-parent' : 'no-child',
+            via: 'subagents',
+            error: String(error?.message ?? error),
           })
         }
+      } else {
+        void debug?.({
+          event: 'detached-notify',
+          taskId,
+          ok: false,
+          via: 'subagents',
+          reason: child ? 'no-parent' : 'no-child',
+        })
+      }
+      // 后台补报发生在任何一轮之外，没有 live caller 可用；走 sessionController.prompt
+      // 把一句话直接投进秘书会话（和私聊喊人是同一条路）。
+      let controller
+      try {
+        controller = typeof ctx?.get === 'function' ? ctx.get('sessionController') : undefined
+      } catch {
+        controller = undefined
+      }
+      if (typeof controller?.prompt !== 'function') {
+        void debug?.({ event: 'detached-notify', taskId, ok: false, via: 'prompt', reason: 'no-prompt' })
+        return
+      }
+      try {
+        await controller.prompt(
+          {
+            sessionId: target,
+            content: [{ type: 'text', text }],
+            requestId: `detached-notify-${taskId}-${Date.now().toString(36)}`,
+          },
+          new AbortController().signal,
+        )
+        void debug?.({ event: 'detached-notify', taskId, ok: true, via: 'prompt' })
       } catch (error) {
-        void debug?.({ event: 'detached-notify', taskId, ok: false, error: String(error?.message ?? error) })
+        void debug?.({
+          event: 'detached-notify',
+          taskId,
+          ok: false,
+          via: 'prompt',
+          error: String(error?.message ?? error),
+        })
       }
     }
     let ticking = false
