@@ -393,6 +393,57 @@ export async function readSessionTurnReply(sessionId, afterTime, root = join(hom
 }
 
 /**
+ * 只看「这一轮有没有结束」，不要求有 assistant 文本。
+ *
+ * 有的回合收尾只有工具调用、没有最后一句；`readSessionTurnReply` 会一直返回空，
+ * 父会话就会误以为它还在跑。detach 的后台 watcher 和 continueTask 用它兜底：
+ * 看到 `turn/end` 就算这一轮结束，文本可以为空。
+ *
+ * @param sessionId - 子会话 id。
+ * @param afterTime - 只要这个时间之后开始的轮次（epoch ms）。
+ * @param root - sessions 根目录。
+ * @returns 该轮是否已经结束。
+ */
+export async function readSessionTurnEnded(sessionId, afterTime, root = join(homedir(), '.dsh', 'sessions')) {
+  const file = await findSessionFile(sessionId, root)
+  if (!file) return false
+  let buffer
+  try {
+    buffer = await readFile(file)
+  } catch {
+    return false
+  }
+  const from = Math.max(0, buffer.length - SESSION_TAIL_BYTES)
+  let offset = buffer.indexOf(ZSTD_MAGIC, from)
+  let turnStarted = 0
+  let ended = false
+  while (offset !== -1) {
+    let text = ''
+    try {
+      text = zstdDecompressSync(buffer.subarray(offset)).toString('utf8')
+    } catch {
+      text = ''
+    }
+    for (const line of text.split('\n')) {
+      if (line.trim() === '') continue
+      let event
+      try {
+        event = JSON.parse(line)
+      } catch {
+        continue
+      }
+      if (event?.type === 'turn/start') {
+        turnStarted = Number(event?.time ?? 0)
+      } else if (event?.type === 'turn/end' && turnStarted >= afterTime) {
+        ended = true
+      }
+    }
+    offset = buffer.indexOf(ZSTD_MAGIC, offset + 4)
+  }
+  return ended
+}
+
+/**
  * 读「某时刻之后收到的最新一句 assistant 文本」，不等 turn/end。
  *
  * 监考问「是不是卡住了」时，BOT 的答复可能还在同一轮里，turn/end 还没写；
@@ -574,6 +625,7 @@ export async function waitForSessionTurnReply(sessionId, afterTime, timeoutMs, o
   let loopWarned = false
   let lastDigestAt = 0
   let ignoreGrowthUntil = 0
+  let lastTurnEndCheck = 0
   const nudge = typeof options.nudge === 'function' ? options.nudge : null
   const cancel = typeof options.cancel === 'function' ? options.cancel : null
   // 提醒本身会写进子会话，不能让它把自己的写入当成「BOT 还在动」。
@@ -607,6 +659,11 @@ export async function waitForSessionTurnReply(sessionId, afterTime, timeoutMs, o
       if (readFallback) {
         const text = readFallback()
         if (fresh(text)) return { text, why: 'ok' }
+      }
+      // 有的回合只有工具调用、没有最后一句；看到 turn/end 也算结束。
+      if (options.acceptEmptyTurnEnd && Date.now() - lastTurnEndCheck >= 3000) {
+        lastTurnEndCheck = Date.now()
+        if (await readSessionTurnEnded(sessionId, afterTime, root)) return { text: '', why: 'ok' }
       }
       if (!file) {
         file = await findSessionFile(sessionId, root)
@@ -1413,7 +1470,30 @@ export function registerTeamTools(ctx, options) {
    * 只读不打断——它在干活，别去碰它。
    */
   function watchDetachedTask({ taskId, bot, sessionId, startedAt, exec }) {
-    const deadline = Date.now() + 4 * 60 * 60 * 1000
+    const fallbackDeadline = Date.now() + 4 * 60 * 60 * 1000
+    const notifyParent = async (row, text) => {
+      try {
+        const child = liveChildren.get(sessionId) ?? agents?.get?.(sessionId) ?? null
+        if (child && row.parentSession && subagents?.sendMessage) {
+          await subagents.sendMessage(
+            child,
+            row.parentSession,
+            [{ type: 'text', text }],
+            { signal: new AbortController().signal },
+          )
+          void debug?.({ event: 'detached-notify', taskId, ok: true })
+        } else {
+          void debug?.({
+            event: 'detached-notify',
+            taskId,
+            ok: false,
+            reason: child ? 'no-parent' : 'no-child',
+          })
+        }
+      } catch (error) {
+        void debug?.({ event: 'detached-notify', taskId, ok: false, error: String(error?.message ?? error) })
+      }
+    }
     let ticking = false
     const timer = setInterval(async () => {
       if (ticking) return
@@ -1424,27 +1504,38 @@ export function registerTeamTools(ctx, options) {
           clearInterval(timer)
           return
         }
+        const deadline = Number(row.detachedDeadlineMs) || fallbackDeadline
         if (Date.now() > deadline) {
           row.status = 'timeout'
           row.doneAt = Date.now()
-          row.note = '派活调用被中断后一直没等到这一轮说完，后台接力放弃'
+          row.note = '后台接力超时：派活已返回，一直没等到这一轮说完'
           delete row.detached
+          delete row.detachedDeadlineMs
+          running.delete(taskId)
+          pending.delete(sessionId)
           forgetChild(sessionId)
           void persistTasks?.()
           options.api?.broadcast?.({ type: 'tasks' })
+          await notifyParent(row, `【团队】${bot.name ?? bot.id} 的 ${taskId} 超时了（后台补报）：派活已返回，但一直没等到这一轮说完。`)
           void debug?.({ event: 'detached-timeout', taskId, bot: bot.id })
           clearInterval(timer)
           return
         }
         const text = await readSessionTurnReply(sessionId, startedAt)
-        if (!text) return
+        // 有的回合没有最后一句；turn/end 到了也算干完，别让父会话一直等。
+        if (!text && !(await readSessionTurnEnded(sessionId, startedAt))) return
         const usage = usageBook?.take?.(sessionId)
         if (usage) row.tokens = usage
         row.status = 'ready'
         row.doneAt = Date.now()
         row.output = text.slice(0, 4000)
-        row.note = '派活调用被中断，这一轮结果是后台接力补记的'
+        row.note = text
+          ? '后台接力补记：派活已返回，这一轮结果是后台补记的'
+          : '后台接力补记：这一轮没有文字产出，去看交付物'
         delete row.detached
+        delete row.detachedDeadlineMs
+        running.delete(taskId)
+        pending.delete(sessionId)
         forgetChild(sessionId)
         void persistTasks?.()
         options.api?.broadcast?.({ type: 'tasks' })
@@ -1458,33 +1549,12 @@ export function registerTeamTools(ctx, options) {
         void maybeQueueReview(row, exec)
         void debug?.({ event: 'detached-finish', taskId, bot: bot.id, bytes: text.length })
         // 账本变了不会自己开一轮，所以让子会话给秘书发一条消息，把秘书叫醒。
-        // sendMessage 不允许自己发给自己，发送方必须是那个子会话本身。
-        try {
-          const child = liveChildren.get(sessionId)
-          if (child && row.parentSession && subagents?.sendMessage) {
-            await subagents.sendMessage(
-              child,
-              row.parentSession,
-              [
-                {
-                  type: 'text',
-                  text: `【团队】${bot.name ?? bot.id} 的 ${taskId} 已经干完（派活调用被中断，这条是后台补报的）：\n${String(text).slice(0, 800)}`,
-                },
-              ],
-              { signal: new AbortController().signal },
-            )
-            void debug?.({ event: 'detached-notify', taskId, ok: true })
-          } else {
-            void debug?.({
-              event: 'detached-notify',
-              taskId,
-              ok: false,
-              reason: child ? 'no-parent' : 'no-child',
-            })
-          }
-        } catch (error) {
-          void debug?.({ event: 'detached-notify', taskId, ok: false, error: String(error?.message ?? error) })
-        }
+        await notifyParent(
+          row,
+          text
+            ? `【团队】${bot.name ?? bot.id} 的 ${taskId} 已经干完（后台补报）：\n${String(text).slice(0, 800)}`
+            : `【团队】${bot.name ?? bot.id} 的 ${taskId} 已经干完（后台补报）：这一轮没有文字产出，去看交付物。`,
+        )
         clearInterval(timer)
       } finally {
         ticking = false
@@ -1799,6 +1869,10 @@ export function registerTeamTools(ctx, options) {
 
       const botId = String(args?.bot ?? '').trim()
       const task = String(args?.task ?? '').trim()
+      const detach = args?.detach === true
+      if (detach && args?.__batch === true) {
+        return JSON.stringify({ status: 'failed', error: 'detach 只能单件用；批量派活请用 team_dispatch_many 的默认同步模式' })
+      }
       if (!botId || !task) {
         return JSON.stringify({ status: 'failed', error: 'bot and task are required' })
       }
@@ -1859,6 +1933,7 @@ export function registerTeamTools(ctx, options) {
         ].join('\n')
         const continued = await continueTask(previous, {
           prompt,
+          detach,
           brief: {
             task,
             goal: args?.goal,
@@ -2151,6 +2226,40 @@ export function registerTeamTools(ctx, options) {
         // 入组失败不影响派活
       }
 
+      let detached = false
+      if (detach) {
+        const entry = tasks?.get(taskId)
+        if (entry) {
+          entry.detached = true
+          entry.status = 'running'
+          entry.note = '后台接力：派活已返回，完成时自动补记'
+          entry.detachedDeadlineMs = Date.now() + Math.max(60_000, taskTimeoutMs() * 2)
+          delete entry.doneAt
+          void persistTasks?.()
+          options.api?.broadcast?.({ type: 'tasks' })
+          watchDetachedTask({
+            taskId,
+            bot,
+            sessionId: started.childId ?? childId,
+            startedAt: entry.startedAt ?? Date.now(),
+            exec,
+          })
+        }
+        detached = true
+        stallWatch.stop()
+        started.result?.catch?.(() => {})
+        await debug?.({ event: 'dispatch-detached', taskId, bot: bot.id, sessionId: started.childId ?? childId })
+        return JSON.stringify({
+          status: 'running',
+          bot: bot.id,
+          taskId,
+          sessionId: started.childId ?? childId,
+          cwd: taskDir,
+          detached: true,
+          message: '已派出，不等这一轮。干完会自动补账并给你发消息；审计也会在完成时自动建。',
+        })
+      }
+
       try {
         // `result` settles after the child's teardown; `output` is its final
         // assistant text, so the tool can return the answer synchronously.
@@ -2348,9 +2457,11 @@ export function registerTeamTools(ctx, options) {
           error: String(error?.message ?? error),
         })
       } finally {
-        pending.delete(childId)
-        running.delete(taskId)
-        const entry = tasks?.get(taskId)
+        if (!detached) {
+          pending.delete(childId)
+          running.delete(taskId)
+        }
+        const entry = detached ? null : tasks?.get(taskId)
         if (entry) {
           // 真实 token：子会话这一趟跑掉的全部 usage，结算时一次性领走。
           const usage = usageBook?.take?.(started?.childId ?? childId)
@@ -2380,7 +2491,7 @@ export function registerTeamTools(ctx, options) {
             startedAt: entry.startedAt ?? Date.now(),
             exec,
           })
-        } else {
+        } else if (!detached) {
           // 只把「还在跑」的行收成 ready：失败 / 超时 / 取消已经写过自己的状态，别覆盖。
           if (entry && (!entry.status || entry.status === 'running')) {
             entry.doneAt = Date.now()
@@ -2422,6 +2533,7 @@ export function registerTeamTools(ctx, options) {
    */
   async function continueTask(entry, request, exec) {
     const prompt = String(request?.prompt ?? '').trim()
+    const detach = request?.detach === true
     const brief = request?.brief ?? entry?.brief ?? null
     const sessionId = String(entry?.sessionId ?? '').trim()
     const baseline = String(entry?.output ?? '')
@@ -2461,6 +2573,27 @@ export function registerTeamTools(ctx, options) {
     void persistTasks?.()
     options.api?.broadcast?.({ type: 'tasks' })
     await debug?.({ event: 'continue', from: entry.taskId, taskId, sessionId, retried: request?.retried === true })
+    if (detach) {
+      const row = tasks?.get(taskId)
+      if (row) {
+        row.detached = true
+        row.note = '后台接力：派活已返回，完成时自动补记'
+        row.detachedDeadlineMs = Date.now() + Math.max(60_000, taskTimeoutMs() * 2)
+        void persistTasks?.()
+        options.api?.broadcast?.({ type: 'tasks' })
+        watchDetachedTask({ taskId, bot, sessionId, startedAt: continuedAt, exec })
+      }
+      await debug?.({ event: 'continue-detached', from: entry.taskId, taskId, sessionId })
+      return {
+        status: 'running',
+        bot: bot.id,
+        taskId,
+        sessionId,
+        cwd: taskDir,
+        detached: true,
+        message: '已接回原会话，不等这一轮。干完会自动补账并给你发消息；审计也会在完成时自动建。',
+      }
+    }
     let probedAt = 0
     const readContinuedAgent = () => {
       const live = liveChildren.get(sessionId) ?? null
@@ -2484,6 +2617,8 @@ export function registerTeamTools(ctx, options) {
       stallAskMs: Number(getSettings()?.stallHardSec ?? 300) * 1000,
       stallGraceMs: Number(getSettings()?.stallGraceSec ?? 120) * 1000,
       stallMaxNormal: 10,
+      // 续聊的回合可能没有最后一句，看到 turn/end 就收尾，别空等。
+      acceptEmptyTurnEnd: true,
       // agent 侧只作兜底：恢复出来的会话有时 status=idle 但 session 里没有任何事件。
       readFallback: () => {
         const agent = readContinuedAgent()
@@ -2521,6 +2656,7 @@ export function registerTeamTools(ctx, options) {
       else if (why === 'loop') row.note = '子会话在原地打转（同一工具、同一组参数调用 8 次），已提前结束'
       else if (why === 'timeout') row.note = `续聊超过 ${Math.round(taskTimeoutMs() / 1000)} 秒没回来`
       else if (text !== '') row.output = text.slice(0, 4000)
+      else row.note = '这一轮没有文字产出，去看交付物'
       if (usage) row.tokens = usage
     }
     void persistTasks?.()
@@ -3171,7 +3307,7 @@ export function registerTeamTools(ctx, options) {
     {
       name: 'team_dispatch',
     description:
-      '把一件活派给团队里的某个 Bot。Bot 在自己的任务会话里干活（只能写工作区，写不出去），干完返回结论。同一件成果的修改 / 补充 / 优化，用 continueFrom 接回原会话；和上一件无关的新活不要填，直接新开。',
+      '把一件活派给团队里的某个 Bot。Bot 在自己的任务会话里干活（只能写工作区，写不出去），干完返回结论。同一件成果的修改 / 补充 / 优化，用 continueFrom 接回原会话；和上一件无关的新活不要填，直接新开。默认同步等结果；detach=true 时立刻返回任务号，不占主会话，Bot 完成/超时会发消息唤醒你，并自动建审计。',
     parameters: {
       bot: { type: 'string', required: true, description: 'Bot 的 id，例如 nova' },
       task: { type: 'string', required: true, description: '任务单正文（一句话说清要干什么）' },
@@ -3186,6 +3322,7 @@ export function registerTeamTools(ctx, options) {
       dependsOnMode: { type: 'string', description: 'done（默认，上游跑完就放行）或 accepted（上游验收通过才放行）。' },
       dependsOnTimeoutSec: { type: 'number', description: '等依赖的最长秒数，默认 1800；超时则 blocked。' },
       review: { type: 'boolean', description: '是否强制审计：默认有 deliverable 就 true；显式 false 可跳过。审计员的活不审。' },
+      detach: { type: 'boolean', description: '异步派活：调用立刻返回任务号，不阻塞主会话；Bot 完成/超时会发消息唤醒你，并自动建审计。单件可用，批量不支持；continueFrom 也支持。' },
     },
     output: {
       schema: { type: 'string' },
@@ -3209,7 +3346,7 @@ export function registerTeamTools(ctx, options) {
     {
       name: 'team_dispatch_many',
       description:
-        '一次派多件活，可声明依赖。带 dependsOn 的项等上游跑完再开；同一批里可以用 key 给任务起别名，dependsOn 直接写 key。互不依赖的项并行，最多按并发上限；某件失败/打回，它下游会标 blocked，不会 spawn。',
+        '一次派多件活，可声明依赖。带 dependsOn 的项等上游跑完再开；同一批里可以用 key 给任务起别名，dependsOn 直接写 key。互不依赖的项并行，最多按并发上限；某件失败/打回，它下游会标 blocked，不会 spawn。批量默认同步汇总；单件异步用 team_dispatch 的 detach=true，批量不支持 detach。',
       parameters: {
         tasks: {
           type: 'string',
@@ -4393,6 +4530,12 @@ export function registerTeamTools(ctx, options) {
       if (sid === '') return ''
       for (const row of tasks.values()) {
         if (row?.sessionId !== sid || row.status !== 'chat') continue
+        return row.chatKind === 'private' ? 'private' : 'work'
+      }
+      // 派活/审计任务完成后 status 不是 'chat'，但会话仍是 Bot 的工作聊天。
+      // 只按 status === 'chat' 会把这些会话当普通会话，界面于是又露出「团队协作」开关。
+      for (const row of tasks.values()) {
+        if (row?.sessionId !== sid || !row?.bot) continue
         return row.chatKind === 'private' ? 'private' : 'work'
       }
       try {

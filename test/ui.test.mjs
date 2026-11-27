@@ -261,6 +261,7 @@ test('成员卡点一下会去开它的会话', async () => {
       name: 'Nova',
       role: '研究员',
       status: 'idle',
+      worked: true,
       rank: 0,
       lv: 1,
       stars: 0,

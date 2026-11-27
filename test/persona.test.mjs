@@ -109,8 +109,9 @@ test('装饰子会话时只注入 soul.txt，不再读 JSON 里的 persona', asy
 
   const persona = sections.find((section) => section.name === 'dsh-team/persona')
   assert.ok(persona, '没注入人设段')
-  assert.match(persona.text, /文件里的人设/)
-  assert.doesNotMatch(persona.text, /JSON 里的旧人设/)
+  const personaText = typeof persona.text === 'function' ? persona.text() : persona.text
+  assert.match(personaText, /文件里的人设/)
+  assert.doesNotMatch(personaText, /JSON 里的旧人设/)
 
   // AGENTS.md 是宿主塞的用户消息，删不掉，只能在 system prompt 里压过它。
   const scope = sections.find((section) => section.name === 'dsh-team/scope')

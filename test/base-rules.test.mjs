@@ -85,8 +85,9 @@ test('a child gets the rules as their own section, before the persona', async ()
   assert.equal(rules.text, BASE_RULES)
   // 底座的正文不掺人设：改 persona 改不动它。
   assert.ok(!rules.text.includes('Nova'))
-  assert.match(persona.text, /Nova/)
-  assert.match(persona.text, /只决定你怎么说话/)
+  const personaText = typeof persona.text === 'function' ? persona.text() : persona.text
+  assert.match(personaText, /Nova/)
+  assert.match(personaText, /只决定你怎么说话/)
 })
 
 /** 一个带工具服务的假 agent：私聊里要给它注册 remember、再挡掉别的工具。 */

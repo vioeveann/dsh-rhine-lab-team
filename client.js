@@ -645,9 +645,16 @@ window.__ModuleLoader__.load({
     /**
      * 这个会话是不是 Bot 的私聊 / 工作聊天。是的话「团队协作」整块不显示：
      * 团队协作只在主会话里有意义，Bot 会话里开着就是自己派活给自己。
-     * 答案按会话缓存一次，切会话时不再问。
+     * 非空答案按会话缓存；空结果不缓存，等任务行落盘后再问。
      */
     const botChatKinds = new Map()
+    // 刚从私聊入口打开、但 session-kind 还没回填的会话：新会话守卫先用它兜底。
+    const privateSessionIds = new Set()
+    // apply() 里的新会话守卫读不到闭包，给它一个只读判断。
+    internals.isPrivateSession = (sessionId) => {
+      const sid = String(sessionId ?? '')
+      return botChatKinds.get(sid) === 'private' || privateSessionIds.has(sid)
+    }
 
     function useBotChatKind(props) {
       const sessionId = resolveSessionId(props)
@@ -664,7 +671,9 @@ window.__ModuleLoader__.load({
             if (!res.ok) return
             const data = await res.json()
             const next = typeof data?.kind === 'string' ? data.kind : ''
-            botChatKinds.set(sessionId, next)
+            // 空结果不缓存：任务行可能还没落盘，过一会儿再问就有了。
+            // 缓存空值会让这个会话永远被当成普通会话，开关再也藏不掉。
+            if (next !== '') botChatKinds.set(sessionId, next)
             if (alive) setKind(next)
           } catch {
             // 问不到就当普通会话：藏开关是小，报错是大。
@@ -5727,6 +5736,7 @@ function createMembersPanel(React, host) {
       // 私聊是根会话：它就是一条普通会话，交给主视图打开，
       // 这样左侧会话列表里也有它（子会话地址只会开成一栏聊天，不进列表）。
       if (standalone) {
+        if (asPrivate) privateSessionIds.add(sessionId)
         stampTeamIdentity(sessionId, openedIdentity)
         const workspace = service('uiWorkspace')
         if (!workspace || typeof workspace.openSession !== 'function') {
@@ -6922,8 +6932,8 @@ function createMembersPanel(React, host) {
 
     return {
       // ctx 只代理声明过的服务：没在这里写的服务，读到的永远是 undefined。
-      // 只需要这三样：槽位（注册界面）、tab 类型（右栏页）、右栏（开页）。
-      inject: ['slots', 'sidebarRightTabs', 'sidebarRight'],
+      // 前三样是团队 UI；后两样只给“私聊新会话回默认工作区”的守卫用。
+      inject: ['slots', 'sidebarRightTabs', 'sidebarRight', 'uiWorkspace', 'workspaces'],
       internals,
       apply(ctx) {
         /**
@@ -6938,6 +6948,65 @@ function createMembersPanel(React, host) {
             reportDiag({ event: 'slot-register-failed', where: label, build: BUILD_STAMP, error: String(error?.message ?? error) })
           }
         }
+        /**
+         * 私聊 Bot 里点「新会话」时，DSH 默认沿用当前工作区。当前是
+         * 「私聊会话」工作区的话，新会话会继续落进私聊目录，把私聊会话的
+         * 工作区越攒越乱。这里只在“当前会话确实是私聊”时，把目标改回
+         * 私聊工作区之前的那一个工作区；其余情况原样放行。
+         * 只包插件自己的客户端，不改 DSH 的 app.asar。
+         */
+        const installPrivateNewChatGuard = () => {
+          let uiWorkspace
+          let workspaces
+          try {
+            uiWorkspace = typeof ctx.get === 'function' ? ctx.get('uiWorkspace') : ctx.uiWorkspace
+            workspaces = typeof ctx.get === 'function' ? ctx.get('workspaces') : ctx.workspaces
+          } catch {
+            return () => {}
+          }
+          if (!uiWorkspace || typeof uiWorkspace.startSession !== 'function') return () => {}
+          if (!workspaces?.list || typeof workspaces.list.getSnapshot !== 'function') return () => {}
+          const original = uiWorkspace.startSession
+          const isPrivateWorkspace = (workspace) => {
+            const title = String(workspace?.title ?? '')
+            const path = String(workspace?.path ?? '')
+            return title === '私聊会话' || /[\\/]rhine-lab-team[\\/]chats[\\/]?$/i.test(path)
+          }
+          const pickDefaultWorkspace = () => {
+            let items = []
+            try {
+              items = workspaces.list.getSnapshot()?.items ?? []
+            } catch {
+              return undefined
+            }
+            const privateIndex = items.findIndex(isPrivateWorkspace)
+            const before = privateIndex >= 0 ? items.slice(0, privateIndex) : items
+            const candidates = before.filter((workspace) => (
+              workspace?.workspaceId && !isPrivateWorkspace(workspace)
+            ))
+            return candidates.length > 0 ? candidates[candidates.length - 1].workspaceId : undefined
+          }
+          const wrapped = function (workspaceId, options) {
+            try {
+              if (workspaceId === undefined) {
+                const current = uiWorkspace.selection?.getSnapshot?.().sessionId
+                if (current && internals.isPrivateSession?.(current)) {
+                  const target = pickDefaultWorkspace()
+                  if (target !== undefined) return original.call(uiWorkspace, target, options)
+                }
+              }
+            } catch {
+              // 守卫失败不能挡住新会话本身，回落到 DSH 原逻辑。
+            }
+            return original.call(uiWorkspace, workspaceId, options)
+          }
+          uiWorkspace.startSession = wrapped
+          return () => {
+            if (uiWorkspace.startSession === wrapped) uiWorkspace.startSession = original
+          }
+        }
+        safeEffect(() => installPrivateNewChatGuard(), 'dsh-team: 私聊新会话回默认工作区')
+
         // 离线测试要能直接渲染编辑器，正常路径不碰它。
         internals.createMembersPanel = createMembersPanel
         reportDiag({ event: 'apply', build: BUILD_STAMP })
